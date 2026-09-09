@@ -8,6 +8,7 @@ import Data.Set (Set)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (LocalTime)
+import Data.Vector (Vector)
 import Data.Word (Word64)
 
 import EVM.Dapp (DappInfo)
@@ -20,7 +21,7 @@ import Echidna.SourceMapping (CodehashMap)
 import Echidna.Types.Cache
 import Echidna.Types.Campaign (CampaignConf)
 import Echidna.Types.Corpus (Corpus)
-import Echidna.Types.Coverage (CoverageMap)
+import Echidna.Types.Coverage (CoverageMap, CovSlot)
 import Echidna.Types.InterWorker (Bus)
 import Echidna.Types.Solidity (SolConf)
 import Echidna.Types.Test (TestConf, EchidnaTest)
@@ -173,6 +174,12 @@ data Env = Env
   , coverageRefRuntime :: IORef CoverageMap
   , corpusRef :: IORef Corpus
   , initialCorpusReplayRef :: IORef InitialCorpusReplayState
+
+  -- | Per-agent coverage slots, indexed by 'WorkerState.covSlot'. Allocated
+  -- once in 'mkEnv'; see 'CovSlot'.
+  , coverageSlots :: Vector CovSlot
+  -- | The extra slot used for deployment-time coverage, outside any agent.
+  , deploymentSlot :: CovSlot
 
   , slitherInfo :: Maybe SlitherInfo
   , codehashMap :: CodehashMap

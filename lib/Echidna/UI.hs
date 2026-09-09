@@ -265,10 +265,10 @@ ui vm dict initialCorpus cliSelectedContract = do
 
           maybeResult <- timeout timeoutUsecs $ case workerType of
             FuzzWorker -> do
-              let agent = FuzzerAgent workerId vm dict corpus testLimit stateRef True
+              let agent = FuzzerAgent workerId workerId vm dict corpus testLimit stateRef True
               runAgent agent bus env
             SymbolicWorker -> do
-              let agent = SymbolicAgent vm dict corpus cliSelectedContract stateRef
+              let agent = SymbolicAgent workerId vm dict corpus cliSelectedContract stateRef
               runAgent agent bus env
 
           pure $ case maybeResult of
@@ -289,7 +289,7 @@ ui vm dict initialCorpus cliSelectedContract = do
             TimeLimitReached | workerType == FuzzWorker -> do
               tests <- traverse readIORef env.testRefs
               when (any needsShrinking tests) $ void $ do
-                let shrinkAgent = FuzzerAgent workerId vm dict [] 0 stateRef False
+                let shrinkAgent = FuzzerAgent workerId workerId vm dict [] 0 stateRef False
                 runAgent shrinkAgent bus env
             _ -> pure ()
           liftIO $ pushCampaignEvent env (WorkerEvent workerId workerType (WorkerStopped stopReason))

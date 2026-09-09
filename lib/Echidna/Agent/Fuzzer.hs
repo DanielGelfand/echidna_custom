@@ -58,6 +58,8 @@ instance (MonadThrow m) => MonadThrow (RandT g m) where
 
 data FuzzerAgent = FuzzerAgent
   { fuzzerId :: Int
+  , covSlot :: Int
+    -- ^ Index of this agent's coverage slot in 'Env.coverageSlots'
   , initialVm :: VM Concrete
   , initialDict :: GenDict
   , initialCorpus :: [(FilePath, [Tx])]
@@ -85,6 +87,7 @@ instance Agent FuzzerAgent where
 
         initialState = WorkerState
           { workerId
+          , covSlot = agent.covSlot
           , genDict = effectiveGenDict
           , newCoverage = False
           , ncallseqs = 0

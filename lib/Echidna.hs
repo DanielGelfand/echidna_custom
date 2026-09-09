@@ -11,6 +11,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import Data.Vector qualified as V
 import System.Console.ANSI (hNowSupportsANSI)
 import System.FilePath ((</>))
 import System.IO (stderr, stdout, hPutStrLn)
@@ -32,12 +33,14 @@ import Echidna.SourceMapping (findSrcForReal)
 import Echidna.SymExec.Symbolic (forceAddr)
 import Echidna.Types.Campaign
 import Echidna.Types.Config
+import Echidna.Types.Coverage (newCovSlot)
 import Echidna.Types.Random
 import Echidna.Types.Signature (ContractName)
 import Echidna.Types.Solidity
 import Echidna.Types.Test (EchidnaTest)
 import Echidna.Types.Tx
 import Echidna.Types.World
+import Echidna.Worker (getNWorkers)
 
 -- | This function is used to prepare, process, compile and initialize smart contracts for testing.
 -- It takes:
@@ -130,6 +133,10 @@ mkEnv cfg buildOutput tests world slitherInfo = do
   coverageRefRuntime <- newIORef mempty
   corpusRef <- newIORef mempty
   initialCorpusReplayRef <- newIORef InitialCorpusReplayComplete
+  -- One coverage slot per agent (fuzz workers and the optional symbolic
+  -- worker) plus a trailing one for deployment-time coverage.
+  coverageSlots <- V.generateM (getNWorkers cfg.campaignConf + 1) newCovSlot
+  let deploymentSlot = V.last coverageSlots
   testRefs <- traverse newIORef tests
   fetchSession <- EVM.Fetch.mkSession cfg.campaignConf.corpusDir (fromIntegral <$> cfg.rpcBlock)
   contractNameCache <- newIORef mempty
@@ -139,5 +146,6 @@ mkEnv cfg buildOutput tests world slitherInfo = do
       sourceCache = buildOutput.sources
   pure $ Env { cfg, dapp, sourceCache, codehashMap, fetchSession, contractNameCache
              , chainId, eventQueue, bus, coverageRefInit, coverageRefRuntime, corpusRef, initialCorpusReplayRef, testRefs, world
+             , coverageSlots, deploymentSlot
              , slitherInfo, useColor
              }

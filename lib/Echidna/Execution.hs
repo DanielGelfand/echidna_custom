@@ -238,7 +238,9 @@ execTxOptC
   => VM Concrete -> Tx
   -> m (VMResult Concrete, VM Concrete)
 execTxOptC vm tx = do
-  ((res, grew), vm') <- runStateT (execTxWithCov tx) (resetTxTransientState vm)
+  env <- ask
+  slot <- gets (.covSlot)
+  ((res, grew), vm') <- runStateT (execTxWithCov (env.coverageSlots V.! slot) tx) (resetTxTransientState vm)
   let vm'' = clearTxBookkeeping vm'
   when grew $ do
     modify' $ \workerState ->

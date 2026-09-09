@@ -61,7 +61,10 @@ instance (MonadThrow m) => MonadThrow (RandT g m) where
   throwM = lift . throwM
 
 data SymbolicAgent = SymbolicAgent
-  { initialVm :: VM Concrete
+  { covSlot :: Int
+    -- ^ Index of this agent's coverage slot in 'Env.coverageSlots'. Unique per
+    -- agent even though the symbolic agent runs as worker 0 too.
+  , initialVm :: VM Concrete
   , initialDict :: GenDict
   , initialCorpus :: [(FilePath, [Tx])]
   , contractName :: Maybe Text
@@ -86,6 +89,7 @@ instance Agent SymbolicAgent where
 
         initialState = WorkerState
           { workerId
+          , covSlot = agent.covSlot
           , genDict = effectiveGenDict
           , newCoverage = False
           , ncallseqs = 0
