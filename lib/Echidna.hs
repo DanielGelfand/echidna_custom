@@ -9,6 +9,7 @@ import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
+import Data.Primitive.PrimVar (newPrimVar)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Vector qualified as V
@@ -133,6 +134,7 @@ mkEnv cfg buildOutput tests world slitherInfo = do
   bus <- newBroadcastTChanIO
   coverageRefInit <- newIORef mempty
   coverageRefRuntime <- newIORef mempty
+  coveragePoints <- newPrimVar 0
   corpusRef <- newIORef mempty
   initialCorpusReplayRef <- newIORef InitialCorpusReplayComplete
   -- One coverage slot per agent (fuzz workers and the optional symbolic
@@ -147,7 +149,7 @@ mkEnv cfg buildOutput tests world slitherInfo = do
   let dapp = dappInfo "/" buildOutput
       sourceCache = buildOutput.sources
   pure $ Env { cfg, dapp, sourceCache, codehashMap, fetchSession, contractNameCache
-             , chainId, eventQueue, bus, coverageRefInit, coverageRefRuntime, corpusRef, initialCorpusReplayRef, testRefs, world
+             , chainId, eventQueue, bus, coverageRefInit, coverageRefRuntime, coveragePoints, corpusRef, initialCorpusReplayRef, testRefs, world
              , coverageSlots, deploymentSlot
              , slitherInfo, useColor
              }

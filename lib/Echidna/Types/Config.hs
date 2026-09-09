@@ -4,12 +4,14 @@ import Control.Concurrent.STM (TChan)
 import Data.Aeson (FromJSON(..), withText)
 import Data.Aeson.Key (Key)
 import Data.IORef (IORef, atomicModifyIORef', readIORef, writeIORef)
+import Data.Primitive.PrimVar (PrimVar)
 import Data.Set (Set)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (LocalTime)
 import Data.Vector (Vector)
 import Data.Word (Word64)
+import GHC.Exts (RealWorld)
 
 import EVM.Dapp (DappInfo)
 import EVM.Fetch qualified as Fetch
@@ -172,6 +174,10 @@ data Env = Env
   , testRefs :: [IORef EchidnaTest]
   , coverageRefInit :: IORef CoverageMap
   , coverageRefRuntime :: IORef CoverageMap
+  -- | Number of covered pcs across both coverage maps, bumped when a pc's
+  -- depth word goes from zero to non-zero. Lets status lines and events skip
+  -- rescanning every coverage array.
+  , coveragePoints :: PrimVar RealWorld Int
   , corpusRef :: IORef Corpus
   , initialCorpusReplayRef :: IORef InitialCorpusReplayState
 
