@@ -178,6 +178,10 @@ data Env = Env
   -- depth word goes from zero to non-zero. Lets status lines and events skip
   -- rescanning every coverage array.
   , coveragePoints :: PrimVar RealWorld Int
+  -- | Payload budget for hit-count state (see 'HitCountsMode') and the bytes
+  -- reserved from it so far.
+  , hitCountBudget :: Int
+  , hitCountUsed :: PrimVar RealWorld Int
   , corpusRef :: IORef Corpus
   , initialCorpusReplayRef :: IORef InitialCorpusReplayState
 

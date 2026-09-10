@@ -9,6 +9,7 @@ import Tests.Config (configTests)
 import Tests.Coverage (coverageTests)
 import Tests.Encoding (encodingJSONTests)
 import Tests.Foundry (foundryTests)
+import Tests.HitCounts (hitCountTests)
 import Tests.FoundryTestGen (foundryTestGenTests)
 import Tests.Integration (integrationTests)
 import Tests.MCPParse (mcpParseTests)
@@ -25,6 +26,7 @@ main :: IO ()
 main = withCurrentDirectory "./tests/solidity" . defaultMain $
          testGroup "Echidna"
            [ atomicTests
+           , hitCountTests
            , configTests
            , compilationTests
            , seedTests
