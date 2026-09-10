@@ -49,7 +49,6 @@ import Echidna.Solidity (compileContracts)
 import Echidna.Test (validateTestMode)
 import Echidna.Types.Campaign
 import Echidna.Types.Config
-import Echidna.Types.Coverage (mergeCoverageMaps)
 import Echidna.Types.Solidity
 import Echidna.Types.Test (TestMode, EchidnaTest(..), TestConf(..), TestType(..), TestState(..))
 import Echidna.UI
@@ -149,8 +148,8 @@ main = withUtf8 $ withCP65001 $ withStrippedExceptions $ do
       let contracts = Map.elems env.dapp.solcByName
       saveCoverages env runId dir buildOutput.sources contracts
       when cfg.campaignConf.coverageLineHits $ do
-        covMap <- mergeCoverageMaps env.dapp env.coverageRefInit env.coverageRefRuntime
-        let hits = coverageLineHits buildOutput.sources covMap contracts cfg.campaignConf.coverageExcludes
+        (units, _) <- snapshotCoverage env
+        let hits = coverageLineHits buildOutput.sources units contracts cfg.campaignConf.coverageExcludes
         LBS.writeFile (dir </> "coverage_hits.json") (encode hits)
 
   if isSuccessful tests then exitSuccess else exitWith (ExitFailure 1)

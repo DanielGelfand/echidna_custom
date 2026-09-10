@@ -10,7 +10,7 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit ((@?=), assertBool, testCase)
 import Test.Tasty.QuickCheck (Arbitrary(..), Gen, (===), property, testProperty, resize)
 
-import EVM.Solidity (SourceCache(..))
+import EVM.Solidity (CodeType(..), SourceCache(..))
 import EVM.Types (Addr, W256)
 
 import Echidna.Output.Source (coverageLineHits, ppCoveredCode)
@@ -46,8 +46,8 @@ encodingJSONTests =
               , lines = mempty
               , asts = mempty
               }
-            covMap = Map.singleton (0 :: W256) VU.empty
-            output = ppCoveredCode Txt sourceCache [] covMap Nothing "test" []
+            units = Map.singleton (Runtime, 0 :: W256) VU.empty
+            output = ppCoveredCode Txt sourceCache [] units Nothing Nothing "test" []
         assertBool "expected escaped invalid byte in coverage output" ("\\xfd" `T.isInfixOf` output)
-        coverageLineHits sourceCache covMap [] [] @?= Map.singleton "Bad.sol" Map.empty
+        coverageLineHits sourceCache units [] [] @?= Map.singleton "Bad.sol" Map.empty
     ]

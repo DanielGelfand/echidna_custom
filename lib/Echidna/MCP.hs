@@ -38,7 +38,7 @@ import Data.String (fromString)
 
 import MCP.Server
 import EVM.Dapp (DappInfo(..))
-import EVM.Solidity (SolcContract(..), Method(..))
+import EVM.Solidity (CodeType(..), SolcContract(..), Method(..))
 import EVM.Types (Addr, VM, VMType(Concrete), W256)
 import EVM.ABI (AbiValue(..), AbiType(..), abiValueType)
 import Echidna.Encoding (jsonValueText)
@@ -47,8 +47,8 @@ import Echidna.Test (checkETest, getResultFromVM)
 import Echidna.Types.Test (EchidnaTest(..), TestState(..), TestType(..), TestValue(..), didFail, isOptimizationTest)
 import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Tx (Tx(..), TxCall(..), TxResult, maxGasPerBlock)
-import Echidna.Types.Coverage (CoverageFileType(..), mergeCoverageMaps, coverageStats)
-import Echidna.Output.Source (coverageLineHits, ppCoveredCode, saveLcovHook)
+import Echidna.Types.Coverage (CoverageFileType(..), coverageStats)
+import Echidna.Output.Source (coverageLineHits, ppCoveredCode, saveLcovHook, snapshotCoverage)
 import Echidna.Output.Corpus (loadTxs)
 
 import Echidna.Types.Config
@@ -473,7 +473,7 @@ showCoverageTool args env _ = do
        case Map.toList matches of
          [] -> return $ printf "Error: Contract '%s' not found" (unpack contractName)
          [(k, solc)] -> do
-            covMap <- mergeCoverageMaps dapp env.coverageRefInit env.coverageRefRuntime
+            (units, hits) <- snapshotCoverage env
             let sc = env.sourceCache
 
             -- Identify relevant files: only the file defining the contract
@@ -482,12 +482,12 @@ showCoverageTool args env _ = do
             -- Use all active contracts to generate coverage
             -- This allows showing coverage for a parent contract (e.g. EchidnaTest)
             -- derived from the execution of a child contract (e.g. Echidna).
-            let activeContracts = filter (\c -> c.runtimeCodehash `Map.member` covMap) (Map.elems dapp.solcByName)
+            let activeContracts = filter (\c -> (Runtime, c.runtimeCodehash) `Map.member` units) (Map.elems dapp.solcByName)
             -- If no contracts are active (e.g. no coverage yet), use the requested contract to at least show the source
             let contractsToUse = if null activeContracts then [solc] else activeContracts
 
             -- Generate full report using all active contracts, then filter by relevant files
-            let fullReport = ppCoveredCode Txt sc contractsToUse covMap Nothing "" []
+            let fullReport = ppCoveredCode Txt sc contractsToUse units hits Nothing "" []
             let filterReport text =
                   let ls = T.lines text
                       splitSections [] = []
@@ -1174,9 +1174,9 @@ streamableCoverageStateValue = \case
 
 streamableComputeCoverageLines :: Env -> IO Value
 streamableComputeCoverageLines env = do
-  covMap <- mergeCoverageMaps env.dapp env.coverageRefInit env.coverageRefRuntime
+  (units, _) <- snapshotCoverage env
   let contracts = Map.elems env.dapp.solcByName
-      hits = coverageLineHits env.sourceCache covMap contracts env.cfg.campaignConf.coverageExcludes
+      hits = coverageLineHits env.sourceCache units contracts env.cfg.campaignConf.coverageExcludes
       snapshot = toJSON hits
   BL8.length (encode snapshot) `seq` pure snapshot
 
