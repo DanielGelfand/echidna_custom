@@ -2,7 +2,7 @@ module Tests.Coverage (coverageTests) where
 
 import Test.Tasty (TestTree, testGroup)
 
-import Common (testContract, testContract', passed, countCorpus, checkCoverageUsesCorpusDir, codeUnits, uniqueCodehashes, hitCountInvariants, lineExecutionsReported)
+import Common (testContract, testContract', passed, countCorpus, checkCoverageUsesCorpusDir, codeUnits, uniqueCodehashes, hitCountInvariants, lineExecutionsReported, uniqueEdgesAtLeast)
 import Echidna.Types.Worker (WorkerType(..))
 
 coverageTests :: TestTree
@@ -26,6 +26,11 @@ coverageTests = testGroup "Coverage tests"
   , testContract "coverage/hitcounts.sol"     (Just "coverage/boolean.yaml")
       [ ("hit counts agree with coverage",        hitCountInvariants)
       , ("line executions reported",             lineExecutionsReported)]
+
+  -- Edge coverage: taken jumps are recorded and reported
+  , testContract "coverage/boolean.sol"       (Just "coverage/edges.yaml")
+      [ ("echidna_true failed",                    passed     "echidna_true")
+      , ("jump edges recorded",                    uniqueEdgesAtLeast 4)]
 
   -- Test corpus and coverage directory functionality
   , testContract "basic/revert.sol"              (Just "basic/coverage-test.yaml")

@@ -360,7 +360,7 @@ streamableReliabilityTests = testGroup "streamable MCP reliability"
   , testCase "new coverage events do not retain transaction arrays" $ do
       st <- mkStreamableState 10
       let ts = read "2026-06-06 00:00:00" :: LocalTime
-          event = Worker.WorkerEvent 0 Worker.FuzzWorker (Worker.NewCoverage 7 2 3 (error "transactions should not be retained"))
+          event = Worker.WorkerEvent 0 Worker.FuzzWorker (Worker.NewCoverage 7 2 0 3 (error "transactions should not be retained"))
       recordStreamableEvent defaultMCPConf st ts event
       StreamableEventBuffer _ items <- readIORef st.streamableEventsRef
       case items of

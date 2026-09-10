@@ -19,6 +19,7 @@ import Data.Map (Map, (\\))
 import Data.Map qualified as Map
 import Data.Map.Strict qualified as MapStrict
 import Data.Maybe (mapMaybe)
+import Data.Primitive.PrimVar (atomicReadInt)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Vector qualified as V
@@ -120,8 +121,10 @@ callseqWithStateFlush publishState vm txSeq isReplaying = do
       in (corp', corpusSize corp')
 
     (points, numCodehashes) <- liftIO $ coverageStats env.coveragePoints env.coverageRefInit env.coverageRefRuntime
+    edges <- liftIO $ atomicReadInt env.coverageEdgePoints
     pushWorkerEvent NewCoverage { points
                                 , numCodehashes
+                                , edges
                                 , corpusSize = newSize
                                 , transactions = fst <$> results
                                 }

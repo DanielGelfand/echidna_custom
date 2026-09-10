@@ -22,6 +22,7 @@ module Common
   , uniqueCodehashes
   , hitCountInvariants
   , lineExecutionsReported
+  , uniqueEdgesAtLeast
   , overrideQuiet
   , loadSolTests
   , checkCoverageUsesCorpusDir
@@ -36,6 +37,7 @@ import Data.DoubleWord (Int256)
 import Data.Function ((&))
 import Data.IORef
 import Data.Primitive.PrimArray (readPrimArray)
+import Data.Primitive.PrimVar (readPrimVar)
 import Data.Vector.Unboxed qualified as VU
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.List.Split (splitOn)
@@ -367,6 +369,10 @@ lineExecutionsReported (env, _) = do
           hitsMatchLcov = and [ Map.lookup n lcovDA == Just v | (n, v) <- Map.toList hitsFile ]
       pure $ isJust hits && header > 0 && body > header && revertsOnly && sameLines && hitsMatchLcov
     _ -> pure False
+
+-- | At least @n@ distinct jump edges were recorded (edge coverage on).
+uniqueEdgesAtLeast :: Int -> (Env, WorkerState) -> IO Bool
+uniqueEdgesAtLeast n (env, _) = (>= n) <$> readPrimVar env.coverageEdgePoints
 
 countCorpus :: Int -> (Env, WorkerState) -> IO Bool
 countCorpus n (env, _) = do
