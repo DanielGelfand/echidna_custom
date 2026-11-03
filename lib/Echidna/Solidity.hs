@@ -7,6 +7,7 @@ import Control.Monad.Extra (whenM)
 import Control.Monad.Reader (ReaderT(runReaderT))
 import Control.Monad.ST (stToIO)
 import Control.Monad.State (runStateT)
+import Data.ByteString qualified as BS
 import Data.Foldable (toList)
 import Data.List (find, partition, isSuffixOf, (\\))
 import Data.List.NonEmpty (NonEmpty((:|)))
@@ -234,9 +235,15 @@ loadSpecified env mainContract cs = do
       deployment = if coverageEnabled then snd <$> runStateT (execTxWithCov deployTx) vm2 else snd <$> execTx vm2 deployTx
 
     vm3 <- deployment
-    when (isNothing $ currentContract vm3) $
-      throwM $ DeploymentFailed solConf.contractAddr $
-        applyAnsiColor env.useColor (showTraceTree env.dapp vm3)
+    let deployTrace = applyAnsiColor env.useColor (showTraceTree env.dapp vm3)
+    case currentContract vm3 of
+      Nothing -> throwM $ DeploymentFailed solConf.contractAddr deployTrace
+      Just c | not (hasRuntimeCode c) ->
+        -- The constructor finished without returning runtime code, so there
+        -- is nothing to call and no test can run against the contract.
+        throwM $ DeploymentFailed solConf.contractAddr $
+          "The constructor returned no runtime code.\n" <> deployTrace
+      Just _ -> pure ()
 
     -- Run setUp function
     let
@@ -313,6 +320,13 @@ mkSignatureMap solConf campaignConf mainContract contracts = do
   when (Map.null abiMapping) $
     throwM $ InvalidMethodFilters solConf.methodFilter
   pure abiMapping
+
+-- | Whether a deployed contract holds runtime code that can be called.
+hasRuntimeCode :: Contract -> Bool
+hasRuntimeCode c = case c.code of
+  RuntimeCode (ConcreteRuntimeCode bs) -> not (BS.null bs)
+  RuntimeCode (SymbolicRuntimeCode ops) -> not (null ops)
+  _ -> False
 
 mkTests
   :: SolConf
