@@ -21,6 +21,7 @@ module Common
   , codeUnits
   , uniqueCodehashes
   , hitCountInvariants
+  , lineHitsCountExecutions
   , overrideQuiet
   , loadSolTests
   , checkCoverageUsesCorpusDir
@@ -39,13 +40,16 @@ import Data.Vector.Unboxed qualified as VU
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.List.Split (splitOn)
 import Data.Map qualified as Map
+import Data.List (isSuffixOf)
 import Data.Maybe (isJust)
 import Data.SemVer (Version, version, fromText)
 import Data.Text (Text, pack)
+import Data.Text qualified as T
 import System.Process (readProcess)
 import Test.Tasty (TestTree)
 import Test.Tasty.HUnit (testCase, assertBool)
 
+import EVM.Dapp (DappInfo(..))
 import EVM.Solidity (Contracts(..), BuildOutput(..), SolcContract(..))
 import EVM.Types hiding (Env, Gas)
 
@@ -59,7 +63,8 @@ import Echidna.Types.Agent (runAgent)
 import Echidna.Types.Campaign
 import Echidna.Types.Config (Env(..), EConfig(..), EConfigWithUsage(..))
 import Echidna.Coverage.HitCounts (HitCountSnapshot(..), snapshotHitCounts)
-import Echidna.Types.Coverage (CovEntry(..), coverageStatsExact)
+import Echidna.Output.Source (coverageLineHits, ppCoveredCode, snapshotCoverage)
+import Echidna.Types.Coverage (CovEntry(..), CoverageFileType(..), coverageStatsExact)
 import Echidna.Types.Signature (ContractName)
 import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Test
@@ -327,6 +332,30 @@ hitCountInvariants (env, _) = do
           onlyFailing = or [ f == e && e > 0 | (e, f) <- zip execs failed ]
       pure (agree && bounded && not snap.incomplete, onlyFailing)
   pure $ not (null checks) && all fst checks && any snd checks
+
+-- | Line hits (MCP polling, @coverage_hits.json@) count executions on
+-- coverage/hitcounts.sol: the loop body runs more often than the function
+-- that holds it, the always-reverting line is counted, and every active line
+-- agrees with LCOV's @DA:@ record.
+lineHitsCountExecutions :: (Env, WorkerState) -> IO Bool
+lineHitsCountExecutions (env, _) = do
+  (units, hits) <- snapshotCoverage env
+  let contracts = Map.elems env.dapp.solcByName
+      lineHits = coverageLineHits env.sourceCache units hits contracts []
+      lcov = ppCoveredCode Lcov env.sourceCache contracts units hits Nothing "" []
+      lcovDA = Map.fromList
+        [ (read (T.unpack l) :: Int, read (T.unpack c) :: Int)
+        | da <- T.lines lcov, Just rest <- [T.stripPrefix "DA:" da]
+        , [l, c] <- [T.splitOn "," rest] ]
+  case [ m | (path, m) <- Map.toList lineHits, "hitcounts.sol" `isSuffixOf` path ] of
+    [file] -> do
+      let at n = maybe 0 fromIntegral (Map.lookup n file) :: Int
+          header = at 6      -- function loop(uint8 n) public {
+          body = at 8        -- total += i;
+          reverting = at 13  -- total += x; (always followed by a revert)
+          agreesWithLcov = and [ Map.lookup n lcovDA == Just (fromIntegral v) | (n, v) <- Map.toList file ]
+      pure $ isJust hits && header > 0 && body > header && reverting > 0 && agreesWithLcov
+    _ -> pure False
 
 countCorpus :: Int -> (Env, WorkerState) -> IO Bool
 countCorpus n (env, _) = do

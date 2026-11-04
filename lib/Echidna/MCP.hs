@@ -1174,9 +1174,9 @@ streamableCoverageStateValue = \case
 
 streamableComputeCoverageLines :: Env -> IO Value
 streamableComputeCoverageLines env = do
-  (units, _) <- snapshotCoverage env
+  (units, counts) <- snapshotCoverage env
   let contracts = Map.elems env.dapp.solcByName
-      hits = coverageLineHits env.sourceCache units contracts env.cfg.campaignConf.coverageExcludes
+      hits = coverageLineHits env.sourceCache units counts contracts env.cfg.campaignConf.coverageExcludes
       snapshot = toJSON hits
   BL8.length (encode snapshot) `seq` pure snapshot
 

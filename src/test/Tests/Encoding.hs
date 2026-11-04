@@ -49,5 +49,5 @@ encodingJSONTests =
             units = Map.singleton (Runtime, 0 :: W256) VU.empty
             output = ppCoveredCode Txt sourceCache [] units Nothing Nothing "test" []
         assertBool "expected escaped invalid byte in coverage output" ("\\xfd" `T.isInfixOf` output)
-        coverageLineHits sourceCache units [] [] @?= Map.singleton "Bad.sol" Map.empty
+        coverageLineHits sourceCache units Nothing [] [] @?= Map.singleton "Bad.sol" Map.empty
     ]
