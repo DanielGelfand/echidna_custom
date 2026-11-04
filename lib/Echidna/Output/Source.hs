@@ -4,7 +4,8 @@
 module Echidna.Output.Source where
 
 import Control.Monad (unless)
-import Data.Bits (popCount, (.|.))
+import Data.Aeson (ToJSON(..), object, (.=))
+import Data.Bits ((.|.))
 import Data.ByteString qualified as BS
 import Data.Foldable
 import Data.List (intercalate, nub, sort, sortOn)
@@ -42,7 +43,7 @@ import Echidna.Types.Campaign (CampaignConf(..))
 import Echidna.Types.Config (Env(..), EConfig(..))
 import Echidna.Coverage.HitCounts (HitCountSnapshot(..), snapshotHitCounts)
 import Echidna.Types.Coverage
-  (CoverageInfo, OpIx, TxResults, unpackTxResults, CoverageFileType (..), snapshotUnits)
+  (CoverageInfo, FrozenCoverageMap, OpIx, TxResults, unpackTxResults, CoverageFileType (..), mergeCoverageMaps, snapshotUnits)
 import Echidna.Types.Tx (TxResult(..))
 
 -- | Embedded template with partials for coverage reports. The templates are
@@ -76,10 +77,8 @@ saveCoverages env seed d sc cs = do
   let fileTypes = env.cfg.campaignConf.coverageFormats
       coverageExcludes = env.cfg.campaignConf.coverageExcludes
       projectName = env.cfg.projectName
-  units <- snapshotUnits env.coverageRefInit env.coverageRefRuntime
-  -- Hit counts are reported only when the campaign kept them.
-  hits <- if env.hitCountBudget > 0 then Just <$> snapshotHitCounts env.coverageSlots else pure Nothing
-  mapM_ (\ty -> saveCoverage ty seed d sc cs units hits projectName coverageExcludes) fileTypes
+  snapshot <- snapshotCoverage env
+  mapM_ (\ty -> saveCoverage ty seed d sc cs snapshot projectName coverageExcludes) fileTypes
 
 saveCoverage
   :: CoverageFileType
@@ -87,17 +86,16 @@ saveCoverage
   -> FilePath
   -> SourceCache
   -> [SolcContract]
-  -> UnitCoverage
-  -> Maybe HitCounts
+  -> CoverageSnapshot
   -> Maybe Text
   -> [Text]
   -> IO ()
-saveCoverage fileType seed d sc cs units hits projectName excludePatterns = do
+saveCoverage fileType seed d sc cs snapshot projectName excludePatterns = do
   let extension = coverageFileExtension fileType
       fn = d </> "covered." <> show seed <> extension
   currentTime <- getCurrentTime
   let timestamp = T.pack $ formatTime defaultTimeLocale "%B %d, %Y at %H:%M:%S UTC" currentTime
-      cc = ppCoveredCode fileType sc cs units hits projectName timestamp excludePatterns
+      cc = ppCoveredCode fileType sc cs snapshot projectName timestamp excludePatterns
   createDirectoryIfMissing True d
   writeFile fn cc
 
@@ -114,23 +112,37 @@ saveLcovHook
   -> [SolcContract]
   -> IO FilePath
 saveLcovHook env d sc cs = do
-  (units, hits) <- snapshotCoverage env
+  snapshot <- snapshotCoverage env
   currentTime <- getCurrentTime
   let timestamp = formatTime defaultTimeLocale "%Y%m%d_%H%M%S" currentTime
       fn = d </> "hook_" <> timestamp <> ".lcov"
       excludePatterns = env.cfg.campaignConf.coverageExcludes
-      cc = ppCoveredCode Lcov sc cs units hits Nothing (T.pack timestamp) excludePatterns
+      cc = ppCoveredCode Lcov sc cs snapshot Nothing (T.pack timestamp) excludePatterns
   createDirectoryIfMissing True d
   writeFile fn cc
   pure fn
 
--- | Snapshot the coverage of every code unit, and its hit counts when the
--- campaign kept them.
-snapshotCoverage :: Env -> IO (UnitCoverage, Maybe HitCounts)
+-- | Everything a coverage report is rendered from.
+--
+-- Guardian Sentry reads the LCOV and text reports and the line hits
+-- ('coverageLineHits'), so those keep being computed from 'merged' exactly as
+-- before hit counts existed. Execution counts reach only the HTML report and
+-- the separate 'coverageLineExecutions' outputs, computed from 'units' and
+-- 'hits'.
+data CoverageSnapshot = CoverageSnapshot
+  { merged :: FrozenCoverageMap
+    -- ^ per contract, creation code merged into runtime ('mergeCoverageMaps')
+  , units :: UnitCoverage
+  , hits :: Maybe HitCounts
+    -- ^ only when the campaign kept hit counts
+  }
+
+snapshotCoverage :: Env -> IO CoverageSnapshot
 snapshotCoverage env = do
+  merged <- mergeCoverageMaps env.dapp env.coverageRefInit env.coverageRefRuntime
   units <- snapshotUnits env.coverageRefInit env.coverageRefRuntime
   hits <- if env.hitCountBudget > 0 then Just <$> snapshotHitCounts env.coverageSlots else pure Nothing
-  pure (units, hits)
+  pure CoverageSnapshot { merged, units, hits }
 
 -- | Per-pc coverage of every code unit, keyed by unit.
 type UnitCoverage = Map (CodeType, W256) (VU.Vector CoverageInfo)
@@ -139,21 +151,20 @@ type UnitCoverage = Map (CodeType, W256) (VU.Vector CoverageInfo)
 type HitCounts = Map (CodeType, W256) HitCountSnapshot
 
 -- | Pretty-print the covered code
-ppCoveredCode :: CoverageFileType -> SourceCache -> [SolcContract] -> UnitCoverage -> Maybe HitCounts -> Maybe Text -> Text -> [Text] -> Text
-ppCoveredCode fileType sc cs units hits projectName timestamp excludePatterns
-  | null units = "Coverage map is empty"
+ppCoveredCode :: CoverageFileType -> SourceCache -> [SolcContract] -> CoverageSnapshot -> Maybe Text -> Text -> [Text] -> Text
+ppCoveredCode fileType sc cs snapshot projectName timestamp excludePatterns
+  | null snapshot.merged = "Coverage map is empty"
   | Html <- fileType = htmlTemplate filteredFiles runtimeLinesMap covLines showCounts projectName timestamp commonPrefix
   | otherwise = let
     -- Pretty print individual file coverage
     ppFile (srcPath, srcLines) =
       let runtimeLines = fromMaybe mempty $ Map.lookup srcPath runtimeLinesMap
-          marked = markLines fileType showCounts srcLines runtimeLines (fromMaybe Map.empty (Map.lookup srcPath covLines))
+          marked = markLines fileType srcLines runtimeLines (fromMaybe Map.empty (Map.lookup srcPath resultLines))
       in T.unlines (changeFileName srcPath : changeFileLines (V.toList marked))
     -- Text to add to top of the file
     topHeader = case fileType of
       Lcov -> "TN:\n"
-      Txt | showCounts -> "result markers | executions | failed executions | source\n"
-          | otherwise -> ""
+      Txt  -> ""
     -- Alter file name
     changeFileName (T.pack -> fn) = case fileType of
       Lcov -> "SF:" <> fn
@@ -164,10 +175,12 @@ ppCoveredCode fileType sc cs units hits projectName timestamp excludePatterns
       Txt  -> ls
     in topHeader <> T.unlines (map ppFile filteredFiles)
   where
-    -- Count columns appear when the campaign kept hit counts
-    showCounts = isJust hits
-    -- List of covered lines during the fuzzing campaign
-    covLines = srcMapCov sc units hits cs
+    -- Count cells appear in the HTML report when the campaign kept hit counts
+    showCounts = isJust snapshot.hits
+    -- Covered lines with hit counts, for the HTML report
+    covLines = srcMapCov sc snapshot.units snapshot.hits cs
+    -- Covered lines with their results, for the text and LCOV reports
+    resultLines = srcMapResults sc snapshot.merged cs
     -- Collect all the possible lines from all the files
     allFiles = decodedSourceFiles sc
     -- Find common path prefix for filtering
@@ -177,9 +190,11 @@ ppCoveredCode fileType sc cs units hits projectName timestamp excludePatterns
     -- Excludes lines such as comments or blanks
     runtimeLinesMap = buildRuntimeLinesMap sc cs
 
--- | Mark one particular line, from a list of lines, keeping the order of them
-markLines :: CoverageFileType -> Bool -> V.Vector Text -> S.Set Int -> Map Int LineCoverage -> V.Vector Text
-markLines fileType showCounts codeLines runtimeLines lineMap =
+-- | Mark one particular line, from a list of lines, keeping the order of them.
+-- Guardian Sentry reads the text and LCOV formats, so they are rendered from
+-- 'srcMapResults' exactly as before hit counts existed.
+markLines :: CoverageFileType -> V.Vector Text -> S.Set Int -> Map Int [TxResult] -> V.Vector Text
+markLines fileType codeLines runtimeLines resultMap =
   V.map markLine . V.filter shouldUseLine $ V.indexed codeLines
   where
   shouldUseLine (i, _) = case fileType of
@@ -187,16 +202,8 @@ markLines fileType showCounts codeLines runtimeLines lineMap =
     _ -> True
   markLine (i, codeLine) =
     let n = i + 1
-        covered = Map.lookup n lineMap
-        results = maybe [] (unpackTxResults . (.results)) covered
+        results  = fromMaybe [] (Map.lookup n resultMap)
         markers = sort $ nub $ getMarker <$> results
-        -- Counts: blank on lines that never ran, '?' where a unit mapping
-        -- here keeps no counts
-        (execsCol, failedCol) = case covered of
-          Nothing -> ("", "")
-          Just lc -> case lc.counts of
-            Just c -> (show c.execs, show c.failedExecs)
-            Nothing -> ("?", "?")
         wrapLine :: Text -> Text
         wrapLine line = case fileType of
           Html -> "<span class='" <> cssClass <> "'>" <>
@@ -205,16 +212,9 @@ markLines fileType showCounts codeLines runtimeLines lineMap =
           _ -> line
           where
           cssClass = if n `elem` runtimeLines then getCSSClass markers else "n" -- fallback to 'neutral' class.
-        -- LCOV takes an execution count; without one (counts off, or unknown
-        -- for this line) fall back to the boolean 1/0 form
-        lcovCount = case covered of
-          Just LineCoverage { counts = Just c } | showCounts -> c.execs
-          Just _ -> 1 :: Int
-          Nothing -> 0
         result = case fileType of
-          Lcov -> pack $ printf "DA:%d,%d" n lcovCount
-          _ | showCounts -> pack $ printf " %-4s| %10s | %10s | %s" markers execsCol failedCol (wrapLine codeLine)
-            | otherwise -> pack $ printf " %-4s %s" markers (wrapLine codeLine)
+          Lcov -> pack $ printf "DA:%d,%d" n (length results)
+          _ -> pack $ printf " %-4s %s" markers (wrapLine codeLine)
 
     in result
 
@@ -302,33 +302,107 @@ srcMapCov sc units hits contracts =
               (Map.singleton line (LineCoverage txResults (countAt pc))) acc
           Nothing -> acc
 
--- | Build per-line hit counts for MCP coverage polling.
+-- | Per-line hits of every active line, for MCP coverage polling and
+-- @coverage_hits.json@: the same value as LCOV's @DA:@ record.
 coverageLineHits
   :: SourceCache
-  -> UnitCoverage
+  -> FrozenCoverageMap
   -> [SolcContract]
   -> [Text]
   -> Map FilePath (Map Int Word64)
-coverageLineHits sc units contracts excludePatterns =
+coverageLineHits sc merged contracts =
+  activeLineReport sc contracts (srcMapResults sc merged contracts) (maybe 0 (fromIntegral . length))
+
+-- | Executions of one line, as @coverage_exec_counts.json@ and the MCP
+-- executions feed report them. Both are 'Nothing' (JSON @null@) when the
+-- count is unknown: the campaign kept no hit counts, or a code unit mapping to
+-- the line keeps none.
+data LineExecutions = LineExecutions
+  { executions :: Maybe Int
+    -- ^ executions inside completed transactions
+  , failed :: Maybe Int
+    -- ^ those inside transactions that did not succeed
+  } deriving (Eq, Show)
+
+instance ToJSON LineExecutions where
+  toJSON l = object ["executions" .= l.executions, "failed" .= l.failed]
+
+-- | Per-line execution counts of every active line, keyed like
+-- 'coverageLineHits'. A line that never ran has zero executions.
+coverageLineExecutions
+  :: SourceCache
+  -> UnitCoverage
+  -> Maybe HitCounts
+  -> [SolcContract]
+  -> [Text]
+  -> Map FilePath (Map Int LineExecutions)
+coverageLineExecutions sc units hits contracts =
+  activeLineReport sc contracts (srcMapCov sc units hits contracts) lineExecutions
+  where
+    lineExecutions covered = case (hits, covered) of
+      (Nothing, _) -> LineExecutions Nothing Nothing
+      (Just _, Nothing) -> LineExecutions (Just 0) (Just 0)
+      (Just _, Just lc) -> LineExecutions ((.execs) <$> lc.counts) ((.failedExecs) <$> lc.counts)
+
+-- | One value per active line of every file not excluded, keyed by the path
+-- relative to the sources' common prefix.
+activeLineReport
+  :: SourceCache
+  -> [SolcContract]
+  -> Map FilePath (Map Int b)
+  -> (Maybe b -> a)
+  -> [Text]
+  -> Map FilePath (Map Int a)
+activeLineReport sc contracts covLines valueOf excludePatterns =
   let
-    covLines = srcMapCov sc units Nothing contracts
     allFiles = decodedSourceFiles sc
     commonPrefix = findCommonPathPrefix (map fst allFiles)
     filteredFiles = filterExcludedFiles excludePatterns commonPrefix allFiles
     runtimeLinesMap = buildRuntimeLinesMap sc contracts
-    fileLineHits srcPath =
+    fileLines srcPath =
       let runtimeLines = fromMaybe mempty $ Map.lookup srcPath runtimeLinesMap
           covered = fromMaybe Map.empty (Map.lookup srcPath covLines)
-          lineHits = Map.fromList
-            [ (line, maybe 0 (fromIntegral . popCount . (.results)) (Map.lookup line covered))
-            | line <- S.toList runtimeLines
-            ]
-      in (makeRelativePath commonPrefix srcPath, lineHits)
-  in Map.fromList (map (fileLineHits . fst) filteredFiles)
+      in ( makeRelativePath commonPrefix srcPath
+         , Map.fromList [ (line, valueOf (Map.lookup line covered)) | line <- S.toList runtimeLines ] )
+  in Map.fromList (map (fileLines . fst) filteredFiles)
 
 decodedSourceFiles :: SourceCache -> [(FilePath, V.Vector Text)]
 decodedSourceFiles sc =
   (\(path, src) -> (path, V.fromList (decodeUtf8OrEscaped <$> BS.split 0xa src))) <$> Map.elems sc.files
+
+-- | The results seen on each covered line, as the text and LCOV reports and
+-- 'coverageLineHits' have always computed them: per contract, from its merged
+-- runtime and creation coverage, appending every instruction's results, and
+-- across contracts the first contract to cover a line wins. Kept as is
+-- because Guardian Sentry reads those values; 'srcMapCov' is the unit-based
+-- view that carries hit counts.
+srcMapResults :: SourceCache -> FrozenCoverageMap -> [SolcContract] -> Map FilePath (Map Int [TxResult])
+srcMapResults sc covMap contracts =
+  Map.unionsWith Map.union $ linesCovered <$> contracts
+  where
+  linesCovered :: SolcContract -> Map FilePath (Map Int [TxResult])
+  linesCovered c =
+    case Map.lookup c.runtimeCodehash covMap of
+      Just vec -> VU.foldl' (\acc covInfo -> case covInfo of
+        (-1, _, _) -> acc -- not covered
+        (opIx, _stackDepths, txResults) ->
+          case srcMapForOpLocation c opIx of
+            Just srcMap ->
+              case srcMapCodePos sc srcMap of
+                Just (file, line) ->
+                  Map.alter
+                    (Just . innerUpdate . fromMaybe mempty)
+                    file
+                    acc
+                  where
+                  innerUpdate =
+                    Map.alter
+                      (Just . (<> unpackTxResults txResults) . fromMaybe mempty)
+                      line
+                Nothing -> acc
+            Nothing -> acc
+        ) mempty vec
+      Nothing -> mempty
 
 -- | Given a contract, and tuple as coverage, return the corresponding mapped line (if any)
 srcMapForOpLocation :: SolcContract -> OpIx -> Maybe SrcMap
@@ -351,16 +425,16 @@ checkAssertionsCoverage
   -> Env
   -> IO ()
 checkAssertionsCoverage sc env = do
-  units <- snapshotUnits env.coverageRefInit env.coverageRefRuntime
+  covMap <- mergeCoverageMaps env.dapp env.coverageRefInit env.coverageRefRuntime
   let
     cs = Map.elems env.dapp.solcByName
     asserts = maybe [] (concatMap assertLocationList . Map.elems . (.asserts)) env.slitherInfo
-    covLines = srcMapCov sc units Nothing cs
+    covLines = srcMapResults sc covMap cs
   mapM_ (checkAssertionReached covLines) asserts
 
 -- | Helper function for `checkAssertionsCoverage` which checks a single assertion
 -- and logs a warning if it wasn't hit
-checkAssertionReached :: LineMap -> AssertLocation -> IO ()
+checkAssertionReached :: Map String (Map Int [TxResult]) -> AssertLocation -> IO ()
 checkAssertionReached covLines assert =
   maybe
     warnAssertNotReached checkCoverage
