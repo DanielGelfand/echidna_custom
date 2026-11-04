@@ -13,6 +13,8 @@ import Echidna.Config (defaultConfig, parseConfig)
 import Echidna.Types.Campaign (CampaignConf(..))
 import Echidna.Types.Config (EConfigWithUsage(..), EConfig(..), MCPConf(..), MCPTransport(..), defaultMCPConf, validateMCPConf)
 import Echidna.Types.Tx (TxConf(..))
+import Echidna.Types.Worker (WorkerEvent(..))
+import Echidna.Worker (ppWorkerEvent)
 
 configTests :: TestTree
 configTests = testGroup "Configuration tests" $
@@ -22,6 +24,12 @@ configTests = testGroup "Configuration tests" $
       assertBool "" config.campaignConf.coverageEnabled
   , testCase "coverage enabled by default" $
       assertBool "" defaultConfig.campaignConf.coverageEnabled
+  , testCase "edge coverage enabled by default" $
+      assertBool "" defaultConfig.campaignConf.coverageEdges
+  , testCase "New coverage log keeps its fields in place and appends edges" $ do
+      let line edges = ppWorkerEvent NewCoverage { points = 120, numCodehashes = 4, edges, corpusSize = 7, transactions = [] }
+      assertEqual "without edges" "New coverage: 120 instr, 4 contracts, 7 seqs in corpus (init)" (line 0)
+      assertEqual "with edges" "New coverage: 120 instr, 4 contracts, 7 seqs in corpus (init), 35 edges" (line 35)
   , testCase "parse corpusDir" $ do
       config <- (.econfig) <$> parseConfig "research/bran_bar.yaml"
       assertBool "" $ config.campaignConf.corpusDir == Just "corpus"

@@ -34,7 +34,7 @@ coverageLineHits: true
 coverageHitCounts: "auto"
 #coverageEdges also treats each taken jump (source, target) as coverage, so a
 #new path through already covered code is kept in the corpus
-coverageEdges: false
+coverageEdges: true
 #format can be "text" or "json" for different output (human or machine readable)
 #default is interactive if running on an interactive tty or text mode if not
 format: null

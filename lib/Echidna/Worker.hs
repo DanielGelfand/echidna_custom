@@ -82,9 +82,10 @@ ppWorkerEvent = \case
                                  NoCall -> "no call"
                      [] -> "init"
     in "New coverage: " <> show points <> " instr, "
-      <> (if edges > 0 then show edges <> " edges, " else "")
       <> show numCodehashes <> " contracts, "
       <> show corpusSize <> " seqs in corpus (" <> funcName <> ")"
+      -- appended last so the fields before it keep their place for log parsers
+      <> (if edges > 0 then ", " <> show edges <> " edges" else "")
   SymExecError err ->
     "Symbolic execution failed: " <> err
   SymExecLog msg ->
