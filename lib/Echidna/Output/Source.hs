@@ -4,7 +4,7 @@
 module Echidna.Output.Source where
 
 import Control.Monad (unless)
-import Data.Bits ((.|.))
+import Data.Bits (popCount, (.|.))
 import Data.ByteString qualified as BS
 import Data.Foldable
 import Data.List (intercalate, nub, sort, sortOn)
@@ -205,8 +205,14 @@ markLines fileType showCounts codeLines runtimeLines lineMap =
           _ -> line
           where
           cssClass = if n `elem` runtimeLines then getCSSClass markers else "n" -- fallback to 'neutral' class.
+        -- LCOV takes an execution count; without one (counts off, or unknown
+        -- for this line) fall back to the boolean 1/0 form
+        lcovCount = case covered of
+          Just LineCoverage { counts = Just c } | showCounts -> c.execs
+          Just _ -> 1 :: Int
+          Nothing -> 0
         result = case fileType of
-          Lcov -> pack $ printf "DA:%d,%d" n (lineExecCount covered)
+          Lcov -> pack $ printf "DA:%d,%d" n lcovCount
           _ | showCounts -> pack $ printf " %-4s| %10s | %10s | %s" markers execsCol failedCol (wrapLine codeLine)
             | otherwise -> pack $ printf " %-4s %s" markers (wrapLine codeLine)
 
@@ -249,18 +255,6 @@ data Counts = Counts
 instance Semigroup LineCoverage where
   a <> b = LineCoverage (a.results .|. b.results) (liftA2 addCounts a.counts b.counts)
     where addCounts x y = Counts (x.execs + y.execs) (x.failedExecs + y.failedExecs)
-
--- | The execution count LCOV and 'coverageLineHits' report for a line. Without
--- a count (counts off, or unknown for this line) it falls back to the boolean
--- 1/0 form. A covered line never reports 0: its coverage bits are set as it
--- runs, but its count only once the transaction completes, so a transaction
--- still running or cut short by the time limit leaves covered lines with no
--- committed executions.
-lineExecCount :: Maybe LineCoverage -> Int
-lineExecCount = \case
-  Just LineCoverage { counts = Just c } -> max 1 c.execs
-  Just _ -> 1
-  Nothing -> 0
 
 -- | Merge within one code unit, where several instructions (and several
 -- owning contracts' source maps) land on the same line: the line ran as often
@@ -308,18 +302,16 @@ srcMapCov sc units hits contracts =
               (Map.singleton line (LineCoverage txResults (countAt pc))) acc
           Nothing -> acc
 
--- | Per-line execution counts of every active line, for MCP coverage polling
--- and @coverage_hits.json@; the same values as LCOV's @DA:@ records.
+-- | Build per-line hit counts for MCP coverage polling.
 coverageLineHits
   :: SourceCache
   -> UnitCoverage
-  -> Maybe HitCounts
   -> [SolcContract]
   -> [Text]
   -> Map FilePath (Map Int Word64)
-coverageLineHits sc units hits contracts excludePatterns =
+coverageLineHits sc units contracts excludePatterns =
   let
-    covLines = srcMapCov sc units hits contracts
+    covLines = srcMapCov sc units Nothing contracts
     allFiles = decodedSourceFiles sc
     commonPrefix = findCommonPathPrefix (map fst allFiles)
     filteredFiles = filterExcludedFiles excludePatterns commonPrefix allFiles
@@ -328,7 +320,7 @@ coverageLineHits sc units hits contracts excludePatterns =
       let runtimeLines = fromMaybe mempty $ Map.lookup srcPath runtimeLinesMap
           covered = fromMaybe Map.empty (Map.lookup srcPath covLines)
           lineHits = Map.fromList
-            [ (line, fromIntegral $ lineExecCount (Map.lookup line covered))
+            [ (line, maybe 0 (fromIntegral . popCount . (.results)) (Map.lookup line covered))
             | line <- S.toList runtimeLines
             ]
       in (makeRelativePath commonPrefix srcPath, lineHits)

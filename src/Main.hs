@@ -148,8 +148,8 @@ main = withUtf8 $ withCP65001 $ withStrippedExceptions $ do
       let contracts = Map.elems env.dapp.solcByName
       saveCoverages env runId dir buildOutput.sources contracts
       when cfg.campaignConf.coverageLineHits $ do
-        (units, counts) <- snapshotCoverage env
-        let hits = coverageLineHits buildOutput.sources units counts contracts cfg.campaignConf.coverageExcludes
+        (units, _) <- snapshotCoverage env
+        let hits = coverageLineHits buildOutput.sources units contracts cfg.campaignConf.coverageExcludes
         LBS.writeFile (dir </> "coverage_hits.json") (encode hits)
 
   if isSuccessful tests then exitSuccess else exitWith (ExitFailure 1)
