@@ -32,6 +32,13 @@ coverageTests = testGroup "Coverage tests"
       [ ("echidna_true failed",                    passed     "echidna_true")
       , ("jump edges recorded",                    uniqueEdgesAtLeast 4)]
 
+  -- A new jump into covered code keeps its sequence only with edge coverage:
+  -- the same campaign keeps two more sequences with edges on
+  , testContract "coverage/edge_only.sol"     (Just "coverage/edge_only.yaml")
+      [ ("edge-only novelty kept",                countCorpus 7)]
+  , testContract "coverage/edge_only.sol"     (Just "coverage/edge_only_off.yaml")
+      [ ("instruction novelty only",              countCorpus 5)]
+
   -- Test corpus and coverage directory functionality
   , testContract "basic/revert.sol"              (Just "basic/coverage-test.yaml")
       [ ("corpus count",                           countCorpus 1)]
