@@ -4,37 +4,36 @@
 -- A source map names a file by its compiler id. solc numbers a unit's files in
 -- path order, which is the order crytic-compile lists them in, so the position
 -- of a file in its export is its id. Solar numbers them in another order, so a
--- unit Foundry built with Solar takes its ids from Foundry's build-info.
+-- unit Foundry built with Solar takes its ids from the build-info that
+-- crytic-compile read it from.
 module Echidna.Solidity.Foundry
   ( Compiler(..)
   , FoundryBuild(..)
   , compilerFromVersion
   , readFoundryBuilds
-  , readFoundryCache
+  , foundryOutArg
   , compilerIdsFor
   , foundryPath
   ) where
 
-import Control.Applicative ((<|>))
 import Control.Exception (IOException, try)
-import Control.Monad (forM, guard, when)
+import Control.Monad (forM, guard)
 import Data.Aeson
-  ( FromJSON(..), Value(..), eitherDecode, eitherDecodeFileStrict, withObject
+  ( FromJSON(..), Value, eitherDecode, eitherDecodeFileStrict, withObject
   , (.:), (.:?), (.!=) )
-import Data.Aeson.Key qualified as Key
-import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson.Types (Parser)
 import Data.ByteString.Lazy.Char8 qualified as BSL
-import Data.List (nub)
+import Data.Functor ((<&>))
+import Data.List (nub, sort)
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.Directory (doesFileExist, makeAbsolute)
+import System.Directory (doesDirectoryExist, doesFileExist, listDirectory, makeAbsolute)
 import System.Exit (ExitCode(..))
-import System.FilePath (joinPath, normalise, splitDirectories, (</>))
-import System.IO (hPutStrLn, stderr)
+import System.FilePath
+  (joinPath, normalise, splitDirectories, takeBaseName, takeExtension, (</>))
 import System.Process (cwd, proc, readCreateProcessWithExitCode)
 import Text.Read (readMaybe)
 
@@ -48,9 +47,11 @@ compilerFromVersion version
   | "solar" `T.isInfixOf` T.toLower version = Solar
   | otherwise = Solc
 
--- | One build listed in Foundry's cache.
+-- | One Foundry build-info file.
 data FoundryBuild = FoundryBuild
   { buildId :: Text
+    -- ^ the build-info's file name, which crytic-compile also gives the
+    -- unit's export when there are several
   , compiler :: Compiler
   , sourceIds :: Map FilePath Int
     -- ^ the compiler's file ids, keyed by path as Foundry wrote it: relative
@@ -58,93 +59,53 @@ data FoundryBuild = FoundryBuild
   }
   deriving (Eq, Show)
 
--- | The builds of the Foundry project at the given root, or none when the
--- root is not a Foundry project or its cache is missing.
-readFoundryBuilds :: FilePath -> IO [FoundryBuild]
-readFoundryBuilds root = do
+-- | The builds crytic-compile read for the Foundry project at the given root:
+-- every build-info in @<out>/build-info@, where @<out>@ is the
+-- @--foundry-out-directory@ crytic-compile was given, or else the active
+-- profile's out directory. Each one is a unit of crytic-compile's export.
+-- None when the root is not a Foundry project.
+readFoundryBuilds :: [String] -> FilePath -> IO [FoundryBuild]
+readFoundryBuilds cryticArgs root = do
   isFoundry <- doesFileExist (root </> "foundry.toml")
   if not isFoundry then pure [] else do
-    config <- forgeConfig root
-    let cacheFile = root </> config.cachePath </> "solidity-files-cache.json"
-    hasCache <- doesFileExist cacheFile
-    if hasCache then readFoundryCache root cacheFile else do
-      when (fmap compilerFromVersion config.solc == Just Solar) $
-        hPutStrLn stderr $ "WARNING: Foundry builds " <> root <> " with Solar but keeps no cache at "
-          <> cacheFile <> ", so Echidna can't read Solar's file ids and coverage may be reported on the wrong files"
-      pure []
+    out <- maybe (forgeOut root) pure (foundryOutArg cryticArgs)
+    readBuildInfoDir root (root </> out </> "build-info")
 
--- | The settings of the active Foundry profile that tell where the build
--- went and which compiler ran.
-data ForgeConfig = ForgeConfig
-  { cachePath :: FilePath
-  , solc :: Maybe Text
-  }
+-- | The out directory crytic-compile's @--foundry-out-directory@ names.
+foundryOutArg :: [String] -> Maybe FilePath
+foundryOutArg args = listToMaybe $ mapMaybe outDir (zip args (drop 1 args <> [""]))
+  where
+  outDir ("--foundry-out-directory", dir) | not (null dir) = Just dir
+  outDir (arg, _) = T.unpack <$> T.stripPrefix "--foundry-out-directory=" (T.pack arg)
 
-instance FromJSON ForgeConfig where
-  parseJSON = withObject "forge config" $ \o ->
-    ForgeConfig <$> o .:? "cache_path" .!= "cache" <*> o .:? "solc"
+newtype ForgeOut = ForgeOut FilePath
 
--- | The active profile as @forge config@ resolves it, or Foundry's defaults
--- when forge can't tell.
-forgeConfig :: FilePath -> IO ForgeConfig
-forgeConfig root = do
+instance FromJSON ForgeOut where
+  parseJSON = withObject "forge config" $ \o -> ForgeOut <$> o .:? "out" .!= "out"
+
+-- | The active profile's out directory, as @forge config@ resolves it, or
+-- Foundry's default when forge can't tell.
+forgeOut :: FilePath -> IO FilePath
+forgeOut root = do
   result <- try (readCreateProcessWithExitCode (proc "forge" ["config", "--json"]) { cwd = Just root } "")
   pure $ case result :: Either IOException (ExitCode, String, String) of
-    Right (ExitSuccess, out, _) | Right config <- eitherDecode (BSL.pack out) -> config
-    _ -> ForgeConfig { cachePath = "cache", solc = Nothing }
+    Right (ExitSuccess, out, _) | Right (ForgeOut dir) <- eitherDecode (BSL.pack out) -> dir
+    _ -> "out"
 
--- | The builds a Foundry cache file lists, with the compiler and ids from their
--- build-info files. Only builds the cache lists count, so a build-info left
--- behind by an earlier build is never used. A build whose build-info can't be
--- read keeps no ids, so it matches no unit.
-readFoundryCache :: FilePath -> FilePath -> IO [FoundryBuild]
-readFoundryCache root cacheFile = do
-  exists <- doesFileExist cacheFile
-  if not exists then pure [] else
-    eitherDecodeFileStrict cacheFile >>= \case
-      Left _ -> pure []
-      Right (cache :: FilesCache) -> forM cache.builds $ \bid -> do
-        info <- readBuildInfo (root </> cache.buildInfoDir </> T.unpack bid <> ".json")
-        absRoot <- makeAbsolute root
-        let sourceIds = Map.mapKeys (foundryPath absRoot) (maybe mempty (.ids) info)
-        let version = (info >>= (.version)) <|> Map.lookup bid cache.buildVersions
-        pure FoundryBuild
-          { buildId = bid
-          , compiler = maybe Solc compilerFromVersion version
-          , sourceIds
-          }
-
-data FilesCache = FilesCache
-  { buildInfoDir :: FilePath
-  , builds :: [Text]
-  , buildVersions :: Map Text Text
-    -- ^ the compiler version of each build, from the artifacts it produced
-  }
-
-instance FromJSON FilesCache where
-  parseJSON = withObject "solidity-files-cache" $ \o -> do
-    paths <- o .: "paths"
-    buildInfoDir <- paths .: "build_infos"
-    builds <- o .:? "builds" .!= []
-    files <- o .:? "files" .!= mempty :: Parser (Map Text Value)
-    let buildVersions = Map.fromList (concatMap artifactBuilds (Map.elems files))
-    pure FilesCache { buildInfoDir, builds, buildVersions }
-    where
-    -- A file's artifacts are keyed by contract, then by compiler version;
-    -- each version holds the build ids that produced it.
-    artifactBuilds (Object file)
-      | Just (Object artifacts) <- KeyMap.lookup "artifacts" file =
-          [ (bid, Key.toText version)
-          | Object versions <- KeyMap.elems artifacts
-          , (version, built) <- KeyMap.toList versions
-          , bid <- buildIdsIn built
-          ]
-    artifactBuilds _ = []
-    buildIdsIn = \case
-      Object o -> case KeyMap.lookup "build_id" o of
-        Just (String bid) -> [bid]
-        _ -> concatMap buildIdsIn (KeyMap.elems o)
-      _ -> []
+-- | Every readable build-info file in a directory.
+readBuildInfoDir :: FilePath -> FilePath -> IO [FoundryBuild]
+readBuildInfoDir root dir = do
+  exists <- doesDirectoryExist dir
+  if not exists then pure [] else do
+    files <- sort . filter ((== ".json") . takeExtension) <$> listDirectory dir
+    absRoot <- makeAbsolute root
+    fmap catMaybes $ forM files $ \file -> do
+      info <- either (const Nothing) Just <$> eitherDecodeFileStrict (dir </> file)
+      pure $ info <&> \(BuildInfo version ids) -> FoundryBuild
+        { buildId = T.pack (takeBaseName file)
+        , compiler = maybe Solc compilerFromVersion version
+        , sourceIds = Map.mapKeys (foundryPath absRoot) ids
+        }
 
 -- | A build-info file's compiler version and file ids, keyed by path relative
 -- to the project root. Newer Foundry versions write the ids as
@@ -182,29 +143,24 @@ foundryPath absRoot path
   step dirs "." = dirs
   step dirs part = part : dirs
 
-readBuildInfo :: FilePath -> IO (Maybe BuildInfo)
-readBuildInfo path = do
-  exists <- doesFileExist path
-  if not exists then pure Nothing else
-    either (const Nothing) Just <$> eitherDecodeFileStrict path
-
 -- | The compiler ids of a unit's files, keyed by the ids hevm gave them, when
 -- Foundry built the unit with Solar. The unit is the build that lists exactly
 -- its files: crytic-compile's paths may be absolute, so each one matches the
--- longest trailing part of it that the build lists. 'Left' explains why a Solar unit could not be matched; 'Right
--- Nothing' means the unit's position ids are already the compiler's.
+-- longest trailing part of it that the build lists. 'Left' explains why a
+-- Solar unit could not be matched; 'Right Nothing' means the unit's position
+-- ids are already the compiler's.
 compilerIdsFor :: [FoundryBuild] -> Map Int FilePath -> Either String (Maybe (Map Int Int))
 compilerIdsFor builds files =
   case nub [ (b.compiler, ids) | b <- builds, Just ids <- [idsIn b] ] of
     [] | any ((== Solar) . (.compiler)) builds ->
-           Left "no Solar build in Foundry's cache lists exactly this unit's files"
+           Left "no Solar build-info lists exactly this unit's files"
        | otherwise -> Right Nothing
     [(Solc, _)] -> Right Nothing
     [(Solar, ids)] -> Right (Just ids)
     matches
       | all ((== Solc) . fst) matches -> Right Nothing
       | otherwise ->
-          Left "several builds in Foundry's cache list this unit's files with different ids"
+          Left "several build-infos list this unit's files with different ids"
   where
   idsIn build = do
     guard (Map.size build.sourceIds == Map.size files)

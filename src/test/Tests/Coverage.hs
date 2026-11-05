@@ -13,8 +13,8 @@ import EVM.Solidity (BuildOutput(..), SolcContract(..), SourceCache(..), SrcMap(
 import Common (testContract, passed, countCorpus, checkCoverageUsesCorpusDir)
 import Echidna.Solidity (readSolcBatch)
 import Echidna.Solidity.Foundry
-  ( Compiler(..), FoundryBuild(..), compilerFromVersion, compilerIdsFor, foundryPath
-  , readFoundryBuilds )
+  ( Compiler(..), FoundryBuild(..), compilerFromVersion, compilerIdsFor, foundryOutArg
+  , foundryPath, readFoundryBuilds )
 
 coverageTests :: TestTree
 coverageTests = testGroup "Coverage tests"
@@ -52,10 +52,9 @@ coverageTests = testGroup "Coverage tests"
 
   -- foundry-ids/solar is the same project built by Foundry with Solar, and
   -- exported by crytic-compile 0.3.11, which lists the files in path order
-  -- (Main, Alpha, Zlib). A stale solc build-info of the same files, newer than
-  -- Solar's, sits in out/build-info but is not in Foundry's cache.
+  -- (Main, Alpha, Zlib).
   , testCase "coverage/foundry-ids: a Solar build takes Foundry's ids" $ do
-      builds <- readFoundryBuilds "coverage/foundry-ids/solar"
+      builds <- readFoundryBuilds [] "coverage/foundry-ids/solar"
       map (\b -> (b.buildId, b.compiler)) builds @?= [("8732b5cdf368240e", Solar)]
       byPosition <- mconcat <$> readSolcBatch [] "coverage/foundry-ids/solar/export"
       assertBool "position ids already map Zlib's x + 1 to Zlib.sol, so the fixture shows nothing" $
@@ -69,8 +68,19 @@ coverageTests = testGroup "Coverage tests"
       assertBool "Alpha's Zlib.inc(x) is not mapped to Alpha.sol" $
         (solarPath "src/a/Alpha.sol", "Zlib.inc(x)") `elem` main
 
+  -- out-old holds a solc build of the same files. crytic-compile reads the
+  -- build-info of the out directory it is given, and so does Echidna.
+  , testCase "coverage/foundry-ids: --foundry-out-directory picks the build-info" $ do
+      let outOld = [("e291cf7debf86b84", Solc)]
+          compilers args = map (\b -> (b.buildId, b.compiler)) <$> readFoundryBuilds args "coverage/foundry-ids/solar"
+      compilers ["--foundry-out-directory=out-old"] >>= (@?= outOld)
+      compilers ["--foundry-ignore-compile", "--foundry-out-directory", "out-old"] >>= (@?= outOld)
+      compilers ["--foundry-compile-all"] >>= (@?= [("8732b5cdf368240e", Solar)])
+      readFoundryBuilds [] "coverage/foundry-ids" >>= (@?= [])
+      foundryOutArg ["--foundry-out-directory"] @?= Nothing
+
   , testCase "coverage/foundry-ids: a solc build keeps its position ids" $ do
-      builds <- readFoundryBuilds "coverage/foundry-ids/solc"
+      builds <- readFoundryBuilds [] "coverage/foundry-ids/solc"
       map (\b -> (b.buildId, b.compiler)) builds @?= [("e291cf7debf86b84", Solc)]
       byPosition <- readSolcBatch [] "coverage/foundry-ids/solc/export"
       withBuilds <- readSolcBatch builds "coverage/foundry-ids/solc/export"
@@ -95,12 +105,12 @@ coverageTests = testGroup "Coverage tests"
       compilerIdsFor [] unit @?= Right Nothing
       -- a build listing more files than the unit is another unit
       compilerIdsFor [build "d" Solar [("/p/src/Main.sol", 2), ("/p/src/Zlib.sol", 0), ("/p/src/X.sol", 1)]] unit
-        @?= Left "no Solar build in Foundry's cache lists exactly this unit's files"
+        @?= Left "no Solar build-info lists exactly this unit's files"
       compilerIdsFor [solc, otherSolar] unit @?= Right Nothing
       compilerIdsFor [otherSolar] unit
-        @?= Left "no Solar build in Foundry's cache lists exactly this unit's files"
+        @?= Left "no Solar build-info lists exactly this unit's files"
       compilerIdsFor [solar, solc] unit
-        @?= Left "several builds in Foundry's cache list this unit's files with different ids"
+        @?= Left "several build-infos list this unit's files with different ids"
       compilerIdsFor [solar, solar { buildId = "e" }] unit
         @?= Right (Just (Map.fromList [(0, 1), (1, 0)]))
       -- Imports that differ only in case are two files to the compiler, and a
