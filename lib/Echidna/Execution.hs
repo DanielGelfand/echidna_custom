@@ -18,7 +18,7 @@ import Data.List qualified as List
 import Data.Map (Map, (\\))
 import Data.Map qualified as Map
 import Data.Map.Strict qualified as MapStrict
-import Data.Maybe (isJust, mapMaybe)
+import Data.Maybe (mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Vector qualified as V
@@ -92,7 +92,7 @@ callseqWithStateFlush publishState vm txSeq isReplaying = do
   -- optimization and gas info, and pick our execution function appropriately
   let
     conf = env.cfg.campaignConf
-    coverageEnabled = isJust conf.knownCoverage
+    coverageEnabled = conf.coverageEnabled
     execFunc = if coverageEnabled then execTxOptC else execTx
 
   -- Run each call sequentially. This gives us the result of each call
@@ -119,7 +119,7 @@ callseqWithStateFlush publishState vm txSeq isReplaying = do
       let !corp' = force $ addToCorpus (ncallseqs + 1) results corp
       in (corp', corpusSize corp')
 
-    (points, numCodehashes) <- liftIO $ coverageStats env.coverageRefInit env.coverageRefRuntime
+    (points, numCodehashes) <- liftIO $ coverageStats env.coveragePoints env.coverageRefInit env.coverageRefRuntime
     pushWorkerEvent NewCoverage { points
                                 , numCodehashes
                                 , corpusSize = newSize
@@ -238,7 +238,9 @@ execTxOptC
   => VM Concrete -> Tx
   -> m (VMResult Concrete, VM Concrete)
 execTxOptC vm tx = do
-  ((res, grew), vm') <- runStateT (execTxWithCov tx) (resetTxTransientState vm)
+  env <- ask
+  slot <- gets (.covSlot)
+  ((res, grew), vm') <- runStateT (execTxWithCov (env.coverageSlots V.! slot) tx) (resetTxTransientState vm)
   let vm'' = clearTxBookkeeping vm'
   when grew $ do
     modify' $ \workerState ->

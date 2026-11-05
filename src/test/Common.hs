@@ -18,6 +18,8 @@ module Common
   , solvedWithout
   , solvedUsing
   , countCorpus
+  , codeUnits
+  , uniqueCodehashes
   , overrideQuiet
   , loadSolTests
   , checkCoverageUsesCorpusDir
@@ -53,6 +55,7 @@ import Echidna.Test (checkETest)
 import Echidna.Types.Agent (runAgent)
 import Echidna.Types.Campaign
 import Echidna.Types.Config (Env(..), EConfig(..), EConfigWithUsage(..))
+import Echidna.Types.Coverage (coverageStatsExact)
 import Echidna.Types.Signature (ContractName)
 import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Test
@@ -106,6 +109,7 @@ runContract f selectedContract cfg workerType = do
     FuzzWorker -> do
        let agent = FuzzerAgent 
              { fuzzerId = 0
+             , covSlot = 0
              , initialVm = vm
              , initialDict = dict
                , initialCorpus = []
@@ -116,7 +120,8 @@ runContract f selectedContract cfg workerType = do
        runAgent agent bus env
     SymbolicWorker -> do
        let agent = SymbolicAgent
-             { initialVm = vm
+             { covSlot = 0
+             , initialVm = vm
              , initialDict = dict
              , initialCorpus = []
              , contractName = selectedContract
@@ -284,6 +289,19 @@ solvedWith tx t final =
 solvedWithout :: TxCall -> Text -> (Env, WorkerState) -> IO Bool
 solvedWithout tx t final =
   maybe False (all $ (/= tx) . (.call)) <$> solnFor t final
+
+-- | Check the number of creation and runtime code units with coverage.
+codeUnits :: Int -> Int -> (Env, WorkerState) -> IO Bool
+codeUnits nCreation nRuntime (env, _) = do
+  creation <- readIORef env.coverageRefInit
+  runtime <- readIORef env.coverageRefRuntime
+  pure $ Map.size creation == nCreation && Map.size runtime == nRuntime
+
+-- | Check the number of distinct contracts with coverage, as reported.
+uniqueCodehashes :: Int -> (Env, WorkerState) -> IO Bool
+uniqueCodehashes n (env, _) = do
+  (_, codehashes) <- coverageStatsExact env.coverageRefInit env.coverageRefRuntime
+  pure $ codehashes == n
 
 countCorpus :: Int -> (Env, WorkerState) -> IO Bool
 countCorpus n (env, _) = do

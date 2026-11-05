@@ -2,34 +2,44 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE GADTs #-}
 
-module Echidna.Exec where
+module Echidna.Exec
+  ( execTx
+  , execTxWithCov
+  , initialVM
+  , pattern Reversion
+  , resetTxTransientState
+  , clearTxBookkeeping
+  , setHevmTracesEnabled
+  ) where
 
-import Control.Monad (when, forM_)
+import Control.Monad (void, when)
 import Control.Monad.Catch (MonadThrow(..))
 import Control.Monad.Reader (MonadReader, ask, asks)
 import Control.Monad.ST (ST, stToIO, RealWorld)
 import Control.Monad.State.Strict (MonadState(get, put), execState, runStateT, MonadIO(liftIO), gets, modify', execStateT)
 import Data.Bits
 import Data.ByteString qualified as BS
-import Data.IORef (readIORef, newIORef, writeIORef, modifyIORef')
+import Data.IORef (readIORef, newIORef, writeIORef)
 import Data.Map qualified as Map
 import Data.Maybe (fromMaybe, fromJust)
+import Data.Primitive.PrimArray (readPrimArray)
+import Data.Primitive.PrimVar (fetchAddInt)
 import Data.Text qualified as T
 import Data.Vector qualified as V
-import Data.Vector.Unboxed.Mutable qualified as VMut
 import Optics.Core
 import Optics.State.Operators
 import System.Environment (lookupEnv, getEnvironment)
 import System.Process qualified as P
 
-import EVM (bytecode, replaceCodeOfSelf, loadContract, exec1, vmOpIx, clearTStorages)
+import EVM (bytecode, replaceCodeOfSelf, loadContract, exec1, clearTStorages, currentContract)
 import EVM.ABI
-import EVM.Dapp (DappInfo)
+import EVM.Dapp (DappInfo(..))
 import EVM.Effects (defaultConfig)
 import EVM.Exec (exec, vmForEthrunCreation)
 import EVM.Fetch qualified
 import EVM.Format (hexText, showTraceTree)
 import EVM.GetCode qualified as GetCode
+import EVM.Solidity (SolcContract(..))
 import EVM.Types hiding (Env, Gas)
 
 import Echidna.Events (emptyEvents)
@@ -39,7 +49,8 @@ import Echidna.SymExec.Symbolic (forceBuf)
 import Echidna.Transaction
 import Echidna.Types (ExecException(..), fromEVM, emptyAccount)
 import Echidna.Types.Config (Env(..), EConfig(..), UIConf(..), OperationMode(..), OutputFormat(Text))
-import Echidna.Types.Coverage (CoverageInfo)
+import Echidna.Types.Coverage (CovEntry(..), CovSlot, newCovEntry)
+import Echidna.Types.Coverage.Atomic (fetchOrPrimArray)
 import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Tx (TxCall(..), Tx(call, dst, delay), TxResult(..), initialTimestamp, initialBlockNumber, getResult)
 import Echidna.Utility (getTimestamp, timePrefix)
@@ -251,15 +262,31 @@ setHevmTracesEnabled :: Bool -> VM Concrete -> VM Concrete
 setHevmTracesEnabled enabled vm =
   vm { config = vm.config { traceEnabled = enabled } }
 
--- | A type alias for the context we carry while executing instructions
-type CoverageContext = (Bool, Maybe (VMut.IOVector CoverageInfo, Int))
+-- | A type alias for the context we carry while executing instructions:
+-- whether new coverage was found, and the last covered location.
+type CoverageContext = (Bool, Maybe (CovEntry, Int))
+
+-- | The coverage entry of the code being executed, looked up once per
+-- contract switch rather than once per instruction. The executing code only
+-- changes at call boundaries, so nearly every step reuses it.
+data CoverageCache = CoverageCache
+  { code     :: ContractCode
+    -- ^ the key: the code executing at the previous step. Coverage is keyed
+    -- by codehash, so equal code means the same entry whatever the address.
+    -- The 'Eq' short-circuits to a pointer comparison of the underlying
+    -- 'BS.ByteString' when it is the same object, which the loop maintains
+    -- by storing the current step's code on every hit.
+  , covEntry :: Maybe CovEntry
+    -- ^ its coverage entry, if it has any code at all
+  }
 
 -- | Execute a transaction, logging coverage at every step.
 execTxWithCov
   :: (MonadIO m, MonadState (VM Concrete) m, MonadReader Env m, MonadThrow m)
-  => Tx
+  => CovSlot -- ^ private coverage slot of the calling agent
+  -> Tx
   -> m (VMResult Concrete, Bool)
-execTxWithCov tx = do
+execTxWithCov _slot tx = do
   env <- ask
 
   covContextRef <- liftIO $ newIORef (False, Nothing)
@@ -270,15 +297,14 @@ execTxWithCov tx = do
 
   (grew, lastLoc) <- liftIO $ readIORef covContextRef
 
-  -- Update the last valid location with the transaction result
+  -- Record the transaction result at the last executed location. Seeing a
+  -- new result there counts as new coverage; the old value returned by the
+  -- atomic OR says whether this worker was the first to see it.
   grew' <- liftIO $ case lastLoc of
-    Just (vec, pc) -> do
+    Just (entry, pc) -> do
       let txResultBit = fromEnum $ getResult r
-      VMut.read vec pc >>= \case
-        (opIx, depths, txResults) | not (txResults `testBit` txResultBit) -> do
-          VMut.write vec pc (opIx, depths, txResults `setBit` txResultBit)
-          pure True -- we count this as new coverage
-        _ -> pure False
+      old <- fetchOrPrimArray entry.bits (2 * pc + 1) (bit txResultBit)
+      pure $ not (old `testBit` txResultBit)
     _ -> pure False
 
   pure (r, grew || grew')
@@ -286,65 +312,84 @@ execTxWithCov tx = do
     -- the same as EVM.exec but collects coverage, will stop on a query
     execCov env covContextRef = do
       vm <- get
-      (r, vm') <- liftIO $ loop vm
+      -- The context survives across calls: execution resumes here after
+      -- answering a query, and the last location must span the whole tx.
+      ctx <- liftIO $ readIORef covContextRef
+      (r, vm', ctx') <- liftIO $ loop Nothing ctx vm
+      liftIO $ writeIORef covContextRef ctx'
       put vm'
       pure r
       where
       -- | Repeatedly exec a step and add coverage until we have an end result
-      loop :: VM Concrete -> IO (VMResult Concrete, VM Concrete)
-      loop !vm = case vm.result of
+      loop
+        :: Maybe CoverageCache -> CoverageContext -> VM Concrete
+        -> IO (VMResult Concrete, VM Concrete, CoverageContext)
+      loop cache !ctx !vm = case vm.result of
         Nothing -> do
-          addCoverage vm
-          stepVM vm >>= loop
-        Just r -> pure (r, vm)
+          (cache', ctx') <- addCoverage env cache ctx vm
+          vm' <- stepVM vm
+          loop (Just cache') ctx' vm'
+        Just r -> pure (r, vm, ctx)
 
       -- | Execute one instruction on the EVM
       stepVM :: VM Concrete -> IO (VM Concrete)
       stepVM = stToIO . execStateT (exec1 defaultConfig)
 
-      -- | Add current location to the CoverageMap
-      addCoverage :: VM Concrete -> IO ()
-      addCoverage !vm = do
-        let (pc, opIx, depth) = currentCovLoc vm
-            contract = currentContract vm
-            covRef = case contract.code of
-              InitCode _ _ -> env.coverageRefInit
-              _ -> env.coverageRefRuntime
+-- | Add current location to the CoverageMap
+addCoverage
+  :: Env -> Maybe CoverageCache -> CoverageContext -> VM Concrete
+  -> IO (CoverageCache, CoverageContext)
+addCoverage env cache ctx@(grew, _) !vm = do
+  cache'@CoverageCache{covEntry} <- case cache of
+    -- Hit: keep this step's code object so the next comparison is a
+    -- pointer check even if we just switched to a contract whose code is
+    -- equal but not the same object (a clone).
+    Just c | c.code == vm.state.code ->
+      pure CoverageCache { code = vm.state.code, covEntry = c.covEntry }
+    _ -> lookupCoverage env vm
 
-        maybeCovVec <- lookupUsingCodehashOrInsert env.codehashMap contract env.dapp covRef $ do
-          let
-            size = case contract.code of
-              InitCode b _ -> BS.length b
-              _ -> BS.length . forceBuf . fromJust . view bytecode $ contract
-          if size == 0 then pure Nothing else do
-            -- IO for making a new vec
-            vec <- VMut.new size
-            -- We use -1 for opIx to indicate that the location was not covered
-            forM_ [0..size-1] $ \i -> VMut.write vec i (-1, 0, 0)
-            pure $ Just vec
+  ctx' <- case covEntry of
+    Nothing -> pure ctx
+    Just entry -> do
+      let pc = vm.state.pc
+          depth = length vm.frames
+      -- The loop observes `pc == len` right before hevm's implicit STOP, and a
+      -- truncated PUSH can leave pc past the end; neither is a location.
+      if pc >= entry.len then pure ctx else do
+        depths <- readPrimArray entry.bits (2 * pc)
+        if depth < 64 && not (depths `testBit` depth)
+          then do
+            -- Rare path: publish the depth bit, and the Stop bit that marks
+            -- the pc as executed for the report. The old value tells whether
+            -- this worker set the depth bit first.
+            old <- fetchOrPrimArray entry.bits (2 * pc) (bit depth)
+            _ <- fetchOrPrimArray entry.bits (2 * pc + 1) (bit (fromEnum Stop))
+            -- A pc counts as a new unique instruction exactly once.
+            when (old == 0) $ void $ fetchAddInt env.coveragePoints 1
+            pure (grew || not (old `testBit` depth), Just (entry, pc))
+          else pure (grew, Just (entry, pc))
 
-        case maybeCovVec of
-          Nothing -> pure ()
-          Just vec -> do
-            -- TODO: no-op when pc is out-of-bounds. This shouldn't happen but
-            -- we observed this in some real-world scenarios. This is likely a
-            -- bug in another place, investigate.
-            -- ... this should be fixed now, since we use `codeContract` instead
-            -- of `contract` for everything; it may be safe to remove this check.
-            when (pc < VMut.length vec) $
-              VMut.read vec pc >>= \case
-                (_, depths, results) | depth < 64 && not (depths `testBit` depth) -> do
-                  VMut.write vec pc (opIx, depths `setBit` depth, results `setBit` fromEnum Stop)
-                  writeIORef covContextRef (True, Just (vec, pc))
-                _ ->
-                  modifyIORef' covContextRef $ \(new, _) -> (new, Just (vec, pc))
+  pure (cache', ctx')
 
-      -- | Get the VM's current execution location
-      currentCovLoc vm = (vm.state.pc, fromMaybe 0 $ vmOpIx vm, length vm.frames)
+-- | Find (or create) the coverage entry of the contract being executed
+lookupCoverage :: Env -> VM Concrete -> IO CoverageCache
+lookupCoverage env vm = do
+  let contract = fromMaybe (error "no contract information on coverage") $ currentContract vm
+      covRef = case contract.code of
+        InitCode _ _ -> env.coverageRefInit
+        _ -> env.coverageRefRuntime
 
-      -- | Get the current contract being executed
-      currentContract vm = fromMaybe (error "no contract information on coverage") $
-        vm ^? #env % #contracts % at vm.state.codeContract % _Just
+  maybeEntry <- lookupUsingCodehashOrInsert env.codehashMap contract env.dapp covRef $ \key -> do
+    let
+      size = case contract.code of
+        InitCode b _ -> BS.length b
+        _ -> BS.length . forceBuf . fromJust . view bytecode $ contract
+      -- The key is a compile-time hash, so it finds its contract in the dapp
+      -- unless the code is unknown to the build, in which case it owns itself.
+      owner = maybe key ((.runtimeCodehash) . snd) $ Map.lookup key env.dapp.solcByHash
+    if size == 0 then pure Nothing else Just <$> newCovEntry owner contract.opIxMap size
+
+  pure CoverageCache { code = vm.state.code, covEntry = maybeEntry }
 
 initialVM :: Bool -> ST RealWorld (VM Concrete)
 initialVM ffi = do

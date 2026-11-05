@@ -101,7 +101,7 @@ statusTool workerRefs statusRef _ env _ = do
   let iterations = sum $ map (.ncalls) workers
       maxIterations = env.cfg.campaignConf.testLimit
 
-  (covPoints, _) <- coverageStats env.coverageRefInit env.coverageRefRuntime
+  (covPoints, _) <- coverageStats env.coveragePoints env.coverageRefInit env.coverageRefRuntime
 
   tests <- mapM readIORef env.testRefs
   let failedCount = length $ filter didFail tests
@@ -971,7 +971,7 @@ streamableStatus env workerRefs st = do
   workers <- mapM readIORef workerRefs
   tests <- mapM readIORef env.testRefs
   corpus <- readIORef env.corpusRef
-  (points, codehashes) <- coverageStats env.coverageRefInit env.coverageRefRuntime
+  (points, codehashes) <- coverageStats env.coveragePoints env.coverageRefInit env.coverageRefRuntime
   now <- getCurrentTime
   let failedTests = length $ filter didFail tests
       corpusSize = Set.size corpus

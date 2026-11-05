@@ -15,7 +15,7 @@ import Data.List.NonEmpty qualified as NE
 import Data.List.NonEmpty.Extra qualified as NEE
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (isJust, isNothing, catMaybes, listToMaybe, mapMaybe)
+import Data.Maybe (isNothing, catMaybes, listToMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text, isPrefixOf, isSuffixOf, append)
@@ -279,7 +279,7 @@ loadSpecified env mainContract cs = do
 
     -- main contract deployment
     let
-      coverageEnabled = isJust env.cfg.campaignConf.knownCoverage
+      coverageEnabled = env.cfg.campaignConf.coverageEnabled
       deployTx = createTxWithValue
                     mainContract.creationCode
                     solConf.deployer
@@ -287,7 +287,7 @@ loadSpecified env mainContract cs = do
                     unlimitedGasPerBlock
                     (fromIntegral solConf.balanceContract)
                     (0, 0)
-      deployment = if coverageEnabled then snd <$> runStateT (execTxWithCov deployTx) vm2 else snd <$> execTx vm2 deployTx
+      deployment = if coverageEnabled then snd <$> runStateT (execTxWithCov env.deploymentSlot deployTx) vm2 else snd <$> execTx vm2 deployTx
 
     vm3 <- deployment
     let deployTrace = applyAnsiColor env.useColor (showTraceTree env.dapp vm3)

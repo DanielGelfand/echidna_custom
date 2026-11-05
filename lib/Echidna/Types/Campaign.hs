@@ -13,7 +13,7 @@ import EVM.ABI (AbiValue(..))
 
 import Echidna.ABI (GenDict, emptyDict)
 import Echidna.Types
-import Echidna.Types.Coverage (CoverageFileType, CoverageMap)
+import Echidna.Types.Coverage (CoverageFileType)
 import Echidna.Types.Tx (TxResult(..))
 
 -- | Maximum number of functions that can be sampled simultaneously.
@@ -118,9 +118,9 @@ data CampaignConf = CampaignConf
     -- reset the state to avoid unrecoverable states/save memory\"
   , shrinkLimit        :: Int
     -- ^ Maximum number of candidate sequences to evaluate while shrinking
-  , knownCoverage      :: Maybe CoverageMap
-    -- ^ If applicable, initially known coverage. If this is 'Nothing',
-    -- Echidna won't collect coverage information (and will go faster)
+  , coverageEnabled    :: Bool
+    -- ^ Whether to collect coverage. When off, Echidna executes transactions
+    -- without instrumentation (and goes faster) and keeps no corpus feedback.
   , seed               :: Maybe Int
     -- ^ Seed used for the generation of random transactions
   , dictFreq           :: Float
@@ -171,6 +171,8 @@ data CampaignConf = CampaignConf
 data WorkerState = WorkerState
   { workerId    :: !Int
     -- ^ Worker ID starting from 0
+  , covSlot     :: !Int
+    -- ^ Index of this agent's private coverage slot in 'Env.coverageSlots'
   , genDict     :: !GenDict
     -- ^ Generation dictionary
   , newCoverage :: !Bool
@@ -194,6 +196,7 @@ data WorkerState = WorkerState
 initialWorkerState :: WorkerState
 initialWorkerState =
   WorkerState { workerId = 0
+              , covSlot = 0
               , genDict = emptyDict
               , newCoverage = False
               , ncallseqs = 0
