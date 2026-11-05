@@ -11,7 +11,12 @@ import EVM.Types
 
 -- | We throw this when our execution fails due to something other than reversion.
 -- The `Maybe Text` on `UnknownFailure` is an optional stack trace.
-data ExecException = IllegalExec EvmError | UnknownFailure EvmError (Maybe Text)
+data ExecException
+  = IllegalExec EvmError
+  | UnknownFailure EvmError (Maybe Text)
+  -- | No deployed contract matches a compiled contract with functions to call.
+  -- Carries the number of deployed contracts checked.
+  | NoCallableContracts Int
 
 instance Show ExecException where
   show = \case
@@ -20,6 +25,11 @@ instance Show ExecException where
       "Max code size exceeded. " ++ codeSizeErrorDetails limit actual
     UnknownFailure (MaxInitCodeSizeExceeded limit actual) _ ->
       "Max init code size exceeded. " ++ codeSizeErrorDetails limit actual
+    NoCallableContracts n ->
+      "None of the " ++ show n ++ " deployed contracts matches a compiled contract with"
+      ++ " functions to call, so no transaction can be generated. Echidna identifies a"
+      ++ " deployed contract by its runtime code: check that each constructor returns"
+      ++ " the contract's own code."
     UnknownFailure e trace -> "VM failed for unhandled reason, " ++ show e
       ++ ". This shouldn't happen. Please file a ticket with this error message and steps to reproduce!"
       ++ maybe "" ((" Stack trace:\n" ++) . unpack) trace
