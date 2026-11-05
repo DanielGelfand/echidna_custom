@@ -1,27 +1,31 @@
 module Echidna.Solidity where
 
-import Control.Monad (when, unless, forM_)
+import Control.Monad (forM, forM_, guard, unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Catch (MonadThrow(..))
-import Control.Monad.Extra (whenM)
+import Control.Monad.Extra (firstJustM, whenM)
 import Control.Monad.Reader (ReaderT(runReaderT))
 import Control.Monad.ST (stToIO)
 import Control.Monad.State (runStateT)
+import Data.Aeson (FromJSON(..), Value, eitherDecodeFileStrict, withObject, (.:))
+import Data.Aeson.Types (Parser)
+import Data.ByteString qualified as BS
 import Data.Foldable (toList)
-import Data.List (find, partition, isSuffixOf, (\\))
+import Data.List (find, mapAccumL, partition, isSuffixOf, sort, sortOn, (\\))
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.List.NonEmpty qualified as NE
 import Data.List.NonEmpty.Extra qualified as NEE
 import Data.Map (Map)
 import Data.Map qualified as Map
 import Data.Maybe (isJust, isNothing, catMaybes, listToMaybe, mapMaybe)
+import Data.Ord (Down(..))
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text, isPrefixOf, isSuffixOf, append)
 import Data.Text qualified as T
 import Optics.Core hiding (filtered)
 import System.Directory
-  (doesDirectoryExist, doesFileExist, findExecutable, listDirectory, removeFile)
+  (doesDirectoryExist, doesFileExist, findExecutable, getModificationTime, listDirectory, removeFile)
 import System.Exit (ExitCode(..))
 import System.FilePath (joinPath, splitDirectories, (</>))
 import System.FilePath.Posix qualified as FPP
@@ -55,16 +59,99 @@ import Echidna.Types.Tx
 import Echidna.Types.World (World(..))
 import Echidna.Utility (applyAnsiColor, measureIO)
 
-readSolcBatch :: FilePath -> IO [BuildOutput]
-readSolcBatch d = do
-  fs <- filter (".json" `Data.List.isSuffixOf`) <$> listDirectory d
-  mapM parseOne fs
+-- | Read the crytic-compile exports in a directory, one per compilation unit.
+--
+-- A source map names a file by the id its compiler gave it, but a combined
+-- JSON only lists the files, and hevm numbers them by their position in that
+-- list. That matches solc, not Solar, which numbers a unit's files in another
+-- order. When the unit's Foundry build-info is in the given directory, its ids
+-- are used instead. Each unit then gets its own id range: every unit numbers
+-- its files from 0, so merging them would map one unit's ids to another
+-- unit's files.
+readSolcBatch :: FilePath -> FilePath -> IO [BuildOutput]
+readSolcBatch buildInfoDir d = do
+  fs <- sort . filter (".json" `Data.List.isSuffixOf`) <$> listDirectory d
+  units <- forM fs $ \f -> do
+    buildOutput <- parseOne f
+    compilerIds <- findCompilerIds buildInfoDir f buildOutput
+    pure $ maybe buildOutput (`useCompilerIds` buildOutput) compilerIds
+  pure $ snd $ mapAccumL separateUnit 0 units
   where
   parseOne f =
     runApp $ readSolc CombinedJSON "" (d </> f) >>= \case
       Right buildOutput -> pure buildOutput
       Left e ->
         error $ "Failed to parse combined JSON file " <> (d </> f) <> "\n" <> e
+
+-- | The source ids in a Foundry build-info file, keyed by path.
+newtype BuildInfoSourceIds = BuildInfoSourceIds (Map FilePath Int)
+
+instance FromJSON BuildInfoSourceIds where
+  parseJSON = withObject "build-info" $ \o -> do
+    output <- o .: "output"
+    sources <- output .: "sources" :: Parser (Map FilePath Value)
+    BuildInfoSourceIds <$> traverse (withObject "source" (.: "id")) sources
+
+readBuildInfoSourceIds :: FilePath -> IO (Maybe (Map FilePath Int))
+readBuildInfoSourceIds path = do
+  exists <- doesFileExist path
+  if not exists then pure Nothing else
+    either (const Nothing) (\(BuildInfoSourceIds ids) -> Just ids) <$> eitherDecodeFileStrict path
+
+-- | The ids the compiler gave a unit's files, keyed by the ids hevm gave them.
+-- They come from the unit's build-info: the file with the export's name, or
+-- else the newest one that lists exactly the unit's files.
+findCompilerIds :: FilePath -> FilePath -> BuildOutput -> IO (Maybe (Map Int Int))
+findCompilerIds buildInfoDir exportFile buildOutput = do
+  exists <- doesDirectoryExist buildInfoDir
+  if not exists then pure Nothing else do
+    named <- readBuildInfoSourceIds (buildInfoDir </> exportFile)
+    case named >>= idsFor of
+      Just ids -> pure (Just ids)
+      Nothing -> do
+        candidates <- filter (".json" `Data.List.isSuffixOf`) <$> listDirectory buildInfoDir
+        newestFirst <- map fst . sortOn (Down . snd) <$>
+          mapM (\f -> (f,) <$> getModificationTime (buildInfoDir </> f)) candidates
+        firstJustM (fmap (>>= idsFor) . readBuildInfoSourceIds . (buildInfoDir </>)) newestFirst
+  where
+  files = Map.toList buildOutput.sources.files
+  idsFor compilerIds = do
+    guard (Map.size compilerIds == length files)
+    Map.fromList <$> forM files (\(i, (path, _)) -> (i,) <$> lookupPathSuffix compilerIds path)
+
+-- | Build-info paths are relative to the project root, while crytic-compile's
+-- can be absolute: match the longest trailing part of the path.
+lookupPathSuffix :: Map FilePath a -> FilePath -> Maybe a
+lookupPathSuffix m path = listToMaybe $ mapMaybe (`Map.lookup` m) suffixes
+  where
+  parts = splitDirectories path
+  suffixes = [FPP.joinPath (drop n parts) | n <- [0 .. length parts - 1]]
+
+-- | Re-key a unit's source files by their compiler ids. Its source maps
+-- already use those ids.
+useCompilerIds :: Map Int Int -> BuildOutput -> BuildOutput
+useCompilerIds ids (BuildOutput contracts sources) =
+  BuildOutput contracts $ sources & #files %~ rekey & #lines %~ rekey
+  where rekey = Map.mapKeys (\i -> Map.findWithDefault i i ids)
+
+-- | Move a unit's file ids up by the given base, in its source files and in
+-- every source map, and return the base for the next unit.
+separateUnit :: Int -> BuildOutput -> (Int, BuildOutput)
+separateUnit base (BuildOutput (Contracts contracts) sources) =
+  ( base + idCount
+  , BuildOutput (Contracts (shiftContract <$> contracts))
+                (sources & #files %~ Map.mapKeys (+ base) & #lines %~ Map.mapKeys (+ base))
+  )
+  where
+  srcMaps c = toList c.runtimeSrcmap <> toList c.creationSrcmap
+  -- Source maps can name files that are not in the cache, such as solc's
+  -- generated sources, so the range covers those ids too.
+  idCount = 1 + maximum ((-1) : Map.keys sources.files
+                                <> [file | c <- Map.elems contracts, SM _ _ file _ _ <- srcMaps c])
+  shiftContract c = c & #runtimeSrcmap %~ fmap shiftSrcMap & #creationSrcmap %~ fmap shiftSrcMap
+  shiftSrcMap (SM offset len file jump depth)
+    | file >= 0 = SM offset len (file + base) jump depth
+  shiftSrcMap sm = sm
 
 -- | Given a list of files, use its extension to check if it is a precompiled
 -- contract or try to compile it and get a list of its contracts and a list of source
@@ -91,7 +178,7 @@ compileContracts solConf fp = do
         readCreateProcessWithExitCode
           (proc path $ (solConf.cryticArgs ++ solargs) |> x) {std_err = stderr} ""
       case ec of
-        ExitSuccess -> mconcat <$> readSolcBatch "crytic-export"
+        ExitSuccess -> mconcat <$> readSolcBatch (foundryBuildInfoDir solConf.cryticArgs) "crytic-export"
         ExitFailure _ -> throwM $ CompileFailure out err
 
     -- | OS-specific path to the "null" file, which accepts writes without storing them
@@ -100,6 +187,15 @@ compileContracts solConf fp = do
   -- clean up previous artifact files
   removeJsonFiles "crytic-export"
   mconcat . NE.toList <$> mapM compileOne fp
+
+-- | Where a Foundry build run by crytic-compile leaves its build-info files.
+foundryBuildInfoDir :: [String] -> FilePath
+foundryBuildInfoDir args = outDir </> "build-info"
+  where
+  outDir = case args of
+    _ | (_ : dir : _) <- dropWhile (/= "--foundry-out-directory") args -> dir
+    _ | Just dir <- listToMaybe (mapMaybe (T.stripPrefix "--foundry-out-directory=" . T.pack) args) -> T.unpack dir
+    _ -> "out"
 
 removeJsonFiles :: FilePath -> IO ()
 removeJsonFiles dir =
@@ -234,9 +330,15 @@ loadSpecified env mainContract cs = do
       deployment = if coverageEnabled then snd <$> runStateT (execTxWithCov deployTx) vm2 else snd <$> execTx vm2 deployTx
 
     vm3 <- deployment
-    when (isNothing $ currentContract vm3) $
-      throwM $ DeploymentFailed solConf.contractAddr $
-        applyAnsiColor env.useColor (showTraceTree env.dapp vm3)
+    let deployTrace = applyAnsiColor env.useColor (showTraceTree env.dapp vm3)
+    case currentContract vm3 of
+      Nothing -> throwM $ DeploymentFailed solConf.contractAddr deployTrace
+      Just c | not (hasRuntimeCode c) ->
+        -- The constructor finished without returning runtime code, so there
+        -- is nothing to call and no test can run against the contract.
+        throwM $ DeploymentFailed solConf.contractAddr $
+          "The constructor returned no runtime code.\n" <> deployTrace
+      Just _ -> pure ()
 
     -- Run setUp function
     let
@@ -313,6 +415,13 @@ mkSignatureMap solConf campaignConf mainContract contracts = do
   when (Map.null abiMapping) $
     throwM $ InvalidMethodFilters solConf.methodFilter
   pure abiMapping
+
+-- | Whether a deployed contract holds runtime code that can be called.
+hasRuntimeCode :: Contract -> Bool
+hasRuntimeCode c = case c.code of
+  RuntimeCode (ConcreteRuntimeCode bs) -> not (BS.null bs)
+  RuntimeCode (SymbolicRuntimeCode ops) -> not (null ops)
+  _ -> False
 
 mkTests
   :: SolConf
