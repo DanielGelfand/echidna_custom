@@ -1,0 +1,102 @@
+diff --git a/src/EVM.hs b/src/EVM.hs
+index 4b8f561..f033a84 100644
+--- a/src/EVM.hs
++++ b/src/EVM.hs
+@@ -1980,17 +1980,24 @@ cheat gas (inOffset, inSize) (outOffset, outSize) xs = do
+ 
+   pushTrace $ FrameTrace newContext
+   next
+-  vm1 <- get
+-  burn' gas $ pushTo #frames $ Frame
+-                    { state = vm1.state { stack = xs }
+-                    , context = newContext
+-                    }
+-  case maybeLitWordSimp abi of
+-    -- 4-byte function selector
+-    Nothing -> manySolutions (?conf).maxDepth abi 4 $ \case
++  -- Account for the forwarded gas as a normal call does: the caller keeps
++  -- what is left after the burn, the cheatcode runs with the allowance, and
++  -- the unused allowance comes back on return. Run the cheatcode only if the
++  -- burn succeeded: after an OutOfGas its doStop would end the failed frame
++  -- as a success.
++  burn' gas $ do
++    vm1 <- get
++    pushTo #frames $ Frame
++      { state = vm1.state { stack = xs }
++      , context = newContext
++      }
++    assign (#state % #gas) gas
++    case maybeLitWordSimp abi of
++      -- 4-byte function selector
++      Nothing -> manySolutions (?conf).maxDepth abi 4 $ \case
++        Just concAbi -> runCheat concAbi input
++        Nothing -> unexpectedSymArg "symbolic cheatcode selector" [abi]
+       Just concAbi -> runCheat concAbi input
+-      Nothing -> unexpectedSymArg "symbolic cheatcode selector" [abi]
+-    Just concAbi -> runCheat concAbi input
+   where
+     runCheat :: W256 -> Expr 'Buf -> EVM t ()
+     runCheat abi input =  do
+@@ -2846,7 +2853,11 @@ delegateCall this gasGiven xTo xContext xValue xInOffset xInSize xOutOffset xOut
+           \(xTo', xContext') ->
+             precompiledContract this gasGiven xTo' xContext' xValue xInOffset xInSize xOutOffset xOutSize xs
+   | xTo == cheatCode = do
+-      cheat gasGiven (xInOffset, xInSize) (xOutOffset, xOutSize) xs
++      -- Cheatcode calls skip callChecks, so apply its EIP-150 cap here. A
++      -- request above what is left is legal (Solar reads GAS before building
++      -- the calldata), and burning it uncapped aborts the caller with OutOfGas.
++      availableGas <- use (#state % #gas)
++      cheat (capCallGas availableGas gasGiven) (xInOffset, xInSize) (xOutOffset, xOutSize) xs
+   | xTo == consoleAddr = do
+       calldata <- readMemory xInOffset xInSize
+       pushTrace $ ConsoleLog calldata
+@@ -3242,7 +3253,7 @@ finishFrameNoExpectation how = do
+       case nextFrame.context of
+ 
+         -- Were we calling?
+-        CallContext _ _ outOffset outSize _ _ _ reversion subState' -> do
++        CallContext target _ outOffset outSize _ _ _ reversion subState' -> do
+ 
+           -- Excerpt K.1. from the yellow paper:
+           -- K.1. Deletion of an Account Despite Out-of-gas.
+@@ -3280,6 +3291,10 @@ finishFrameNoExpectation how = do
+               revertContracts
+               revertSubstate
+               assign (#state % #returndata) mempty
++              -- A cheatcode that fails (one hevm does not implement, say)
++              -- hands its allowance back, as in Foundry: suites probe
++              -- optional cheatcodes with a low-level call and carry on.
++              when (target == cheatCode) $ reclaimRemainingGasAllowance oldVm
+               push 0
+         -- Or were we creating?
+         CreationContext _ _ reversion subState' -> do
+@@ -3954,6 +3969,7 @@ instance VMOps Symbolic where
+     n <- use (#env % #freshGasVals)
+     pushSym $ Expr.Gas "" n
+   enoughGas _ _ = True
++  capCallGas _ _ = ()
+   subGas _ _ = ()
+   toGas _ = ()
+   whenSymbolicElse a _ = a
+@@ -4140,6 +4156,7 @@ instance VMOps Concrete where
+     push (into vm.state.gas)
+ 
+   enoughGas cost gasCap = cost <= gasCap
++  capCallGas available requested = min requested (allButOne64th available)
+   subGas gasCap cost = gasCap - cost
+   toGas = id
+   whenSymbolicElse _ a = a
+diff --git a/src/EVM/Types.hs b/src/EVM/Types.hs
+index b8bc4ee..53bbe0a 100644
+--- a/src/EVM/Types.hs
++++ b/src/EVM/Types.hs
+@@ -934,6 +934,9 @@ class VMOps (t :: VMType) where
+   payRefunds :: EVM t ()
+   pushGas :: EVM t ()
+   enoughGas :: Word64 -> Gas t -> Bool
++  -- | The gas a call may take: the requested amount, capped at all but 1/64th
++  -- of the gas left (EIP-150).
++  capCallGas :: Gas t -> Gas t -> Gas t
+   subGas :: Gas t -> Word64 -> Gas t
+   toGas :: Word64 -> Gas t
+ 

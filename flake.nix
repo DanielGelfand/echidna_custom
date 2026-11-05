@@ -78,6 +78,7 @@
               ./nix/patches/hevm-create2-prank-deployer.patch
               ./nix/patches/hevm-rpc-tls12-manager.patch
               ./nix/patches/hevm-total-byte-rendering.patch
+              ./nix/patches/hevm-cheat-call-gas-cap.patch
             ] ++ extraPatches;
           }) { secp256k1 = pkgs.secp256k1; })
           ([

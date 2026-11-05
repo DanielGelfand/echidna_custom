@@ -1,12 +1,15 @@
 module Tests.Integration (integrationTests) where
 
+import Control.Monad.Catch (try)
 import Data.Functor ((<&>))
 import Data.Text (unpack)
 import Test.Tasty (TestTree, testGroup)
+import Test.Tasty.HUnit (testCase, assertFailure)
 
 import EVM.ABI (AbiValue(..))
 
-import Common (testContract, testContractV, solcV, testContract', checkConstructorConditions, passed, solved, solvedLen, solvedWith, solvedWithout)
+import Common (testConfig, runContract, testContract, testContractV, solcV, testContract', checkConstructorConditions, passed, solved, solvedLen, solvedWith, solvedWithout)
+import Echidna.Types (ExecException(..))
 import Echidna.Types.Tx (TxCall(..))
 import Echidna.Types.Worker (WorkerType(..))
 
@@ -14,6 +17,12 @@ integrationTests :: TestTree
 integrationTests = testGroup "Solidity Integration Testing"
   [ testContract "basic/true.sol" Nothing
       [ ("echidna_true failed", passed "echidna_true") ]
+  , testCase "bad/noCallable.sol" $ do
+      r <- try $ runContract "bad/noCallable.sol" Nothing testConfig FuzzWorker
+      case r of
+        Left (NoCallableContracts _) -> pure ()
+        Left e -> assertFailure $ "expected NoCallableContracts, got: " <> show e
+        Right _ -> assertFailure "fuzzing a contract with nothing to call did not fail"
   , testContract "basic/flags.sol" Nothing
       [ ("echidna_alwaystrue failed",                      passed      "echidna_alwaystrue")
       , ("echidna_revert_always failed",                   passed      "echidna_revert_always")
