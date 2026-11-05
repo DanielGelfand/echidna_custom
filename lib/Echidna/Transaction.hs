@@ -3,6 +3,7 @@
 
 module Echidna.Transaction where
 
+import Control.Exception (throwIO)
 import Control.Monad (join, when, zipWithM)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Random.Strict (MonadRandom, getRandomR, uniform)
@@ -29,7 +30,7 @@ import Echidna.ABI
 import Echidna.Orphans.JSON ()
 import Echidna.SourceMapping (lookupUsingCodehash)
 import Echidna.SymExec.Symbolic (forceWord, forceAddr)
-import Echidna.Types (fromEVM, Gas)
+import Echidna.Types (ExecException(..), fromEVM, Gas)
 import Echidna.Types.Config (Env(..), EConfig(..))
 import Echidna.Types.Random
 import Echidna.Types.Signature
@@ -69,8 +70,7 @@ genTx world deployedContracts = do
   genDict <- gets (.genDict)
   sigMap <- getSignatures world.highSignatureMap world.lowSignatureMap
   sender <- rElem' world.senders
-  contractAList <- liftIO $ mapM (toContractA env sigMap) (toList deployedContracts)
-  let allContracts = catMaybes contractAList
+  allContracts <- callableContracts env sigMap deployedContracts
 
   (addr, sigs) <- rElem' $ Set.fromList allContracts
   solCall <- genInteractionsM genDict sigs
@@ -86,10 +86,6 @@ genTx world deployedContracts = do
             , value = value
             , delay = level ts
             }
-  where
-    toContractA :: Env -> SignatureMap -> (Expr EAddr, Contract) -> IO (Maybe ContractA)
-    toContractA env sigMap (addr, c) =
-      fmap (forceAddr addr,) . snd <$> lookupUsingCodehash env.codehashMap c env.dapp sigMap
 
 genTxFromPrototype
   :: (MonadIO m, MonadRandom m, MonadState WorkerState m, MonadReader Env m)
@@ -103,8 +99,7 @@ genTxFromPrototype world deployedContracts (pName, pArgs) = do
   genDict <- gets (.genDict)
   sigMap <- getSignatures world.highSignatureMap world.lowSignatureMap
   sender <- rElem' world.senders
-  contractAList <- liftIO $ mapM (toContractA env sigMap) (toList deployedContracts)
-  let allContracts = catMaybes contractAList
+  allContracts <- callableContracts env sigMap deployedContracts
 
   -- Find contracts containing this function with matching arity
   let isMatch (_, sigs) = any (\(n, ts) -> n == pName && length ts == length pArgs) sigs
@@ -140,9 +135,19 @@ genTxFromPrototype world deployedContracts (pName, pArgs) = do
             , value = value
             , delay = level ts
             }
+
+-- | The deployed contracts Echidna can call, each with its ABI. Throws when
+-- none matches, since picking a target from an empty set would crash with
+-- "Set.elemAt: index out of range".
+callableContracts
+  :: MonadIO m => Env -> SignatureMap -> Map (Expr EAddr) Contract -> m [ContractA]
+callableContracts env sigMap deployedContracts = do
+  matched <- liftIO $ catMaybes <$> mapM toContractA (toList deployedContracts)
+  when (null matched) $
+    liftIO $ throwIO $ NoCallableContracts (length deployedContracts)
+  pure matched
   where
-    toContractA :: Env -> SignatureMap -> (Expr EAddr, Contract) -> IO (Maybe ContractA)
-    toContractA env sigMap (addr, c) =
+    toContractA (addr, c) =
       fmap (forceAddr addr,) . snd <$> lookupUsingCodehash env.codehashMap c env.dapp sigMap
 
 genDelay :: MonadRandom m => W256 -> Set W256 -> m W256

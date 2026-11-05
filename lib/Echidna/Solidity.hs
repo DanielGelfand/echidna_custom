@@ -7,8 +7,9 @@ import Control.Monad.Extra (whenM)
 import Control.Monad.Reader (ReaderT(runReaderT))
 import Control.Monad.ST (stToIO)
 import Control.Monad.State (runStateT)
+import Data.ByteString qualified as BS
 import Data.Foldable (toList)
-import Data.List (find, partition, isSuffixOf, (\\))
+import Data.List (find, mapAccumL, partition, isSuffixOf, sort, (\\))
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.List.NonEmpty qualified as NE
 import Data.List.NonEmpty.Extra qualified as NEE
@@ -55,16 +56,43 @@ import Echidna.Types.Tx
 import Echidna.Types.World (World(..))
 import Echidna.Utility (applyAnsiColor, measureIO)
 
+-- | Read the crytic-compile exports in a directory, one per compilation unit.
+--
+-- hevm numbers a unit's files by their position in its sourceList, which
+-- crytic-compile (0.4.0 and later) writes in the compiler's id order, so the
+-- ids match the unit's source maps for solc and Solar alike. But every unit
+-- numbers its files from 0, so each one gets its own id range: merging them
+-- as they are would map one unit's ids to another unit's files.
 readSolcBatch :: FilePath -> IO [BuildOutput]
 readSolcBatch d = do
-  fs <- filter (".json" `Data.List.isSuffixOf`) <$> listDirectory d
-  mapM parseOne fs
+  fs <- sort . filter (".json" `Data.List.isSuffixOf`) <$> listDirectory d
+  units <- mapM parseOne fs
+  pure $ snd $ mapAccumL separateUnit 0 units
   where
   parseOne f =
     runApp $ readSolc CombinedJSON "" (d </> f) >>= \case
       Right buildOutput -> pure buildOutput
       Left e ->
         error $ "Failed to parse combined JSON file " <> (d </> f) <> "\n" <> e
+
+-- | Move a unit's file ids up by the given base, in its source files and in
+-- every source map, and return the base for the next unit.
+separateUnit :: Int -> BuildOutput -> (Int, BuildOutput)
+separateUnit base (BuildOutput (Contracts contracts) sources) =
+  ( base + idCount
+  , BuildOutput (Contracts (shiftContract <$> contracts))
+                (sources & #files %~ Map.mapKeys (+ base) & #lines %~ Map.mapKeys (+ base))
+  )
+  where
+  srcMaps c = toList c.runtimeSrcmap <> toList c.creationSrcmap
+  -- Source maps can name files that are not in the cache, such as solc's
+  -- generated sources, so the range covers those ids too.
+  idCount = 1 + maximum ((-1) : Map.keys sources.files
+                                <> [file | c <- Map.elems contracts, SM _ _ file _ _ <- srcMaps c])
+  shiftContract c = c & #runtimeSrcmap %~ fmap shiftSrcMap & #creationSrcmap %~ fmap shiftSrcMap
+  shiftSrcMap (SM offset len file jump depth)
+    | file >= 0 = SM offset len (file + base) jump depth
+  shiftSrcMap sm = sm
 
 -- | Given a list of files, use its extension to check if it is a precompiled
 -- contract or try to compile it and get a list of its contracts and a list of source
@@ -234,9 +262,15 @@ loadSpecified env mainContract cs = do
       deployment = if coverageEnabled then snd <$> runStateT (execTxWithCov env.deploymentSlot deployTx) vm2 else snd <$> execTx vm2 deployTx
 
     vm3 <- deployment
-    when (isNothing $ currentContract vm3) $
-      throwM $ DeploymentFailed solConf.contractAddr $
-        applyAnsiColor env.useColor (showTraceTree env.dapp vm3)
+    let deployTrace = applyAnsiColor env.useColor (showTraceTree env.dapp vm3)
+    case currentContract vm3 of
+      Nothing -> throwM $ DeploymentFailed solConf.contractAddr deployTrace
+      Just c | not (hasRuntimeCode c) ->
+        -- The constructor finished without returning runtime code, so there
+        -- is nothing to call and no test can run against the contract.
+        throwM $ DeploymentFailed solConf.contractAddr $
+          "The constructor returned no runtime code.\n" <> deployTrace
+      Just _ -> pure ()
 
     -- Run setUp function
     let
@@ -313,6 +347,13 @@ mkSignatureMap solConf campaignConf mainContract contracts = do
   when (Map.null abiMapping) $
     throwM $ InvalidMethodFilters solConf.methodFilter
   pure abiMapping
+
+-- | Whether a deployed contract holds runtime code that can be called.
+hasRuntimeCode :: Contract -> Bool
+hasRuntimeCode c = case c.code of
+  RuntimeCode (ConcreteRuntimeCode bs) -> not (BS.null bs)
+  RuntimeCode (SymbolicRuntimeCode ops) -> not (null ops)
+  _ -> False
 
 mkTests
   :: SolConf

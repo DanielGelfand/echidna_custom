@@ -1,11 +1,11 @@
 module Tests.Compile (compilationTests) where
 
 import Control.Monad (void)
-import Control.Monad.Catch (catch)
+import Control.Monad.Catch (catch, try)
 import Data.SemVer qualified
 import Data.Text (Text)
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase, assertBool)
+import Test.Tasty.HUnit (testCase, assertBool, assertFailure)
 
 import Common (testConfig, solcV, withSolcVersion, loadSolTests)
 import Echidna.Solidity (compileContracts)
@@ -32,11 +32,24 @@ compilationTests = testGroup "Compilation and loading tests"
       \case DeploymentFailed _ _ -> True; _ -> False
   , loadFails "basic/eip-170.sol"  Nothing    "failed to warn on a failed deployment" $
       \case DeploymentFailed _ _ -> True; _ -> False
+  , deploymentMustFail "bad/emptyRuntime.sol"
   , loadFailsWith "bad/propaliased.sol" Nothing "property" "failed to warn on property without bool return" $
       \case PropertyWithoutReturn _ -> True; _ -> False
   , loadFailsWith "bad/optaliased.sol" Nothing "optimization" "failed to warn on optimization with wrong return" $
       \case OptimizationWithWrongReturn _ -> True; _ -> False
   ]
+
+-- | Loading must throw 'DeploymentFailed'; unlike 'loadFails', a load that
+-- throws nothing fails the test.
+deploymentMustFail :: FilePath -> TestTree
+deploymentMustFail fp = testCase fp $ do
+  r <- try $ do
+    buildOutput <- compileContracts testConfig.solConf (pure fp)
+    void $ loadSolTests testConfig buildOutput Nothing
+  case r of
+    Left (DeploymentFailed _ _) -> pure ()
+    Left e -> assertFailure $ "expected DeploymentFailed, got: " <> show e
+    Right () -> assertFailure "deployment did not fail"
 
 loadFails :: FilePath -> Maybe Text -> String -> (SolException -> Bool) -> TestTree
 loadFails fp c = loadFailsWith fp c "property"
