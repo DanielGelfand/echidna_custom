@@ -1,6 +1,6 @@
 module Echidna.Solidity where
 
-import Control.Monad (when, unless, forM_)
+import Control.Monad (forM, forM_, unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Catch (MonadThrow(..))
 import Control.Monad.Extra (whenM)
@@ -25,8 +25,10 @@ import System.Directory
   (doesDirectoryExist, doesFileExist, findExecutable, listDirectory, removeFile)
 import System.Exit (ExitCode(..))
 import System.FilePath (joinPath, splitDirectories, (</>))
+import System.FilePath qualified as FP
 import System.FilePath.Posix qualified as FPP
-import System.IO (openFile, IOMode(..))
+import System.IO (IOMode(..), hPutStrLn, openFile)
+import System.IO qualified as IO
 import System.Info (os)
 import System.Process (StdStream(..), readCreateProcessWithExitCode, proc, std_err)
 
@@ -42,6 +44,7 @@ import Echidna.ABI
   , commonTypeSizes, mkValidAbiInt, mkValidAbiUInt )
 import Echidna.Deploy (deployContracts, deployBytecodes)
 import Echidna.Exec (execTx, execTxWithCov, initialVM)
+import Echidna.Solidity.Foundry (FoundryBuild(..), compilerIdsFor, readFoundryBuilds)
 import Echidna.SourceAnalysis.Slither
 import Echidna.Test (createTests, isAssertionMode, isPropertyMode, isFoundryMode, isOptimizationMode)
 import Echidna.Types.Campaign (CampaignConf(..))
@@ -58,15 +61,17 @@ import Echidna.Utility (applyAnsiColor, measureIO)
 
 -- | Read the crytic-compile exports in a directory, one per compilation unit.
 --
--- hevm numbers a unit's files by their position in its sourceList, which
--- crytic-compile (0.4.0 and later) writes in the compiler's id order, so the
--- ids match the unit's source maps for solc and Solar alike. But every unit
--- numbers its files from 0, so each one gets its own id range: merging them
--- as they are would map one unit's ids to another unit's files.
-readSolcBatch :: FilePath -> IO [BuildOutput]
-readSolcBatch d = do
+-- hevm numbers a unit's files by their position in its sourceList. For solc
+-- that is the compiler's id order. Solar numbers files in another order, which
+-- crytic-compile only follows from 0.4.0 on, so a unit that Foundry built with
+-- Solar takes its ids from its Foundry build-info instead (see
+-- "Echidna.Solidity.Foundry"). Every unit numbers its files from 0, so each
+-- one then gets its own id range: merging them as they are would map one
+-- unit's ids to another unit's files.
+readSolcBatch :: [FoundryBuild] -> FilePath -> IO [BuildOutput]
+readSolcBatch builds d = do
   fs <- sort . filter (".json" `Data.List.isSuffixOf`) <$> listDirectory d
-  units <- mapM parseOne fs
+  units <- forM fs $ \f -> parseOne f >>= useFoundryIds builds f
   pure $ snd $ mapAccumL separateUnit 0 units
   where
   parseOne f =
@@ -74,6 +79,26 @@ readSolcBatch d = do
       Right buildOutput -> pure buildOutput
       Left e ->
         error $ "Failed to parse combined JSON file " <> (d </> f) <> "\n" <> e
+
+-- | Re-key a unit's source files by the ids its compiler gave them, when
+-- Foundry built it with Solar. Its source maps already use those ids.
+useFoundryIds :: [FoundryBuild] -> FilePath -> BuildOutput -> IO BuildOutput
+useFoundryIds [] _ buildOutput = pure buildOutput
+useFoundryIds builds exportFile buildOutput@(BuildOutput contracts sources) =
+  case compilerIdsFor candidates (fst <$> sources.files) of
+    Right Nothing -> pure buildOutput
+    Right (Just ids) ->
+      let rekey = Map.mapKeys (\i -> Map.findWithDefault i i ids)
+      in pure $ BuildOutput contracts $ sources & #files %~ rekey & #lines %~ rekey
+    Left reason -> do
+      hPutStrLn IO.stderr $ "WARNING: " <> exportFile <> ": " <> reason
+        <> ", so its coverage may be reported on the wrong files"
+      pure buildOutput
+  where
+  -- With several units, crytic-compile names each export after its build-info.
+  candidates = case filter ((== T.pack (FP.takeBaseName exportFile)) . (.buildId)) builds of
+    [] -> builds
+    named -> named
 
 -- | Move a unit's file ids up by the given base, in its source files and in
 -- every source map, and return the base for the next unit.
@@ -119,7 +144,10 @@ compileContracts solConf fp = do
         readCreateProcessWithExitCode
           (proc path $ (solConf.cryticArgs ++ solargs) |> x) {std_err = stderr} ""
       case ec of
-        ExitSuccess -> mconcat <$> readSolcBatch "crytic-export"
+        ExitSuccess -> do
+          isProject <- doesDirectoryExist x
+          builds <- if isProject then readFoundryBuilds solConf.cryticArgs x else pure []
+          mconcat <$> readSolcBatch builds "crytic-export"
         ExitFailure _ -> throwM $ CompileFailure out err
 
     -- | OS-specific path to the "null" file, which accepts writes without storing them
