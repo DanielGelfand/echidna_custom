@@ -34,7 +34,7 @@ import Echidna.SourceMapping (findSrcForReal)
 import Echidna.SymExec.Symbolic (forceAddr)
 import Echidna.Types.Campaign
 import Echidna.Types.Config
-import Echidna.Types.Coverage (newCovSlot)
+import Echidna.Types.Coverage (hitCountBudgetFor, newCovSlot)
 import Echidna.Types.Coverage.Atomic (assertWordSize)
 import Echidna.Types.Random
 import Echidna.Types.Signature (ContractName)
@@ -135,6 +135,8 @@ mkEnv cfg buildOutput tests world slitherInfo = do
   coverageRefInit <- newIORef mempty
   coverageRefRuntime <- newIORef mempty
   coveragePoints <- newPrimVar 0
+  hitCountUsed <- newPrimVar 0
+  let hitCountBudget = hitCountBudgetFor cfg.campaignConf.hitCounts
   corpusRef <- newIORef mempty
   initialCorpusReplayRef <- newIORef InitialCorpusReplayComplete
   -- One coverage slot per agent (fuzz workers and the optional symbolic
@@ -150,6 +152,7 @@ mkEnv cfg buildOutput tests world slitherInfo = do
       sourceCache = buildOutput.sources
   pure $ Env { cfg, dapp, sourceCache, codehashMap, fetchSession, contractNameCache
              , chainId, eventQueue, bus, coverageRefInit, coverageRefRuntime, coveragePoints, corpusRef, initialCorpusReplayRef, testRefs, world
+             , hitCountBudget, hitCountUsed
              , coverageSlots, deploymentSlot
              , slitherInfo, useColor
              }

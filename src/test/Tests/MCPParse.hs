@@ -394,6 +394,21 @@ streamableReliabilityTests = testGroup "streamable MCP reliability"
       objectArrayText ["result", "content"] 0 ["text"] toolPayload @?= Just "{\"ready\":true}"
       resourcePayload <- streamableResourcesRead (String "resource") undefined [] st (Just coverageResourceParams)
       objectArrayText ["result", "contents"] 0 ["text"] resourcePayload @?= Just "{\"ready\":true}"
+  , testCase "execution counts are served from their own feed, line hits unchanged" $ do
+      st <- mkStreamableState 10
+      writeIORef st.streamableCoverageRef (StreamableCoverageComputed (object ["hits" .= True]))
+      writeIORef st.streamableCoverageExecutionsRef (StreamableCoverageComputed (object ["executions" .= True]))
+      hitsPayload <- streamableToolsCall (String "tool") undefined [] st (Just coverageToolParams)
+      objectArrayText ["result", "content"] 0 ["text"] hitsPayload @?= Just "{\"hits\":true}"
+      toolPayload <- streamableToolsCall (String "tool") undefined [] st (Just executionsToolParams)
+      objectArrayText ["result", "content"] 0 ["text"] toolPayload @?= Just "{\"executions\":true}"
+      resourcePayload <- streamableResourcesRead (String "resource") undefined [] st (Just executionsResourceParams)
+      objectArrayText ["result", "contents"] 0 ["text"] resourcePayload @?= Just "{\"executions\":true}"
+  , testCase "execution counts before corpus replay completes return not ready" $ do
+      st <- mkStreamableState 10
+      resetInitialCorpusReplayState st.streamableInitialCorpusReplayRef 1
+      toolPayload <- streamableToolsCall (String "tool") undefined [] st (Just executionsToolParams)
+      objectInt ["error", "code"] toolPayload @?= Just streamableCoverageNotReadyCode
   , testCase "corpus replay state resets for a new run" $ do
       replayRef <- newIORef InitialCorpusReplayComplete
       resetInitialCorpusReplayState replayRef 2
@@ -520,14 +535,26 @@ coverageResourceParams = object
   [ "uri" .= ("echidna://coverage/lines" :: T.Text)
   ]
 
+executionsToolParams :: Value
+executionsToolParams = object
+  [ "name" .= ("get_coverage_executions" :: T.Text)
+  , "arguments" .= object []
+  ]
+
+executionsResourceParams :: Value
+executionsResourceParams = object
+  [ "uri" .= ("echidna://coverage/executions" :: T.Text)
+  ]
+
 mkStreamableState :: Int -> IO StreamableMCPState
 mkStreamableState maxEvents = do
   eventsRef <- newIORef (StreamableEventBuffer 0 [])
   coverageRef <- newIORef StreamableCoverageNotComputed
+  coverageExecutionsRef <- newIORef StreamableCoverageNotComputed
   reproducerCacheRef <- newIORef Map.empty
   initialCorpusReplayRef <- newIORef InitialCorpusReplayComplete
   let started = read "2026-06-06 00:00:00 UTC" :: UTCTime
-  pure $ StreamableMCPState eventsRef started maxEvents 65536 coverageRef reproducerCacheRef initialCorpusReplayRef Nothing
+  pure $ StreamableMCPState eventsRef started maxEvents 65536 coverageRef coverageExecutionsRef reproducerCacheRef initialCorpusReplayRef Nothing
 
 nextBodyChunk :: IORef [BS.ByteString] -> IO BS.ByteString
 nextBodyChunk ref =

@@ -10,7 +10,7 @@ import Test.Tasty.HUnit (testCase, assertBool, (@?=))
 
 import EVM.Solidity (BuildOutput(..), SolcContract(..), SourceCache(..), SrcMap(..), getContractsMap)
 
-import Common (testContract, testContract', passed, countCorpus, checkCoverageUsesCorpusDir, codeUnits, uniqueCodehashes)
+import Common (testContract, testContract', passed, countCorpus, checkCoverageUsesCorpusDir, codeUnits, uniqueCodehashes, hitCountInvariants, lineExecutionsReported)
 import Echidna.Solidity (readSolcBatch)
 import Echidna.Types.Worker (WorkerType(..))
 import Echidna.Solidity.Foundry
@@ -34,6 +34,10 @@ coverageTests = testGroup "Coverage tests"
   , testContract' "coverage/shared_runtime.sol" (Just "Main") Nothing (Just "coverage/boolean.yaml") True FuzzWorker
       [ ("creation units keyed by creation code", codeUnits 3 2)
       , ("unique codehashes count owners",        uniqueCodehashes 2)]
+
+  , testContract "coverage/hitcounts.sol"     (Just "coverage/boolean.yaml")
+      [ ("hit counts agree with coverage",        hitCountInvariants)
+      , ("line executions reported",             lineExecutionsReported)]
 
   -- Test corpus and coverage directory functionality
   , testContract "basic/revert.sol"              (Just "basic/coverage-test.yaml")

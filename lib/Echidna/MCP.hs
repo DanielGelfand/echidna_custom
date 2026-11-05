@@ -47,8 +47,8 @@ import Echidna.Test (checkETest, getResultFromVM)
 import Echidna.Types.Test (EchidnaTest(..), TestState(..), TestType(..), TestValue(..), didFail, isOptimizationTest)
 import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Tx (Tx(..), TxCall(..), TxResult, maxGasPerBlock)
-import Echidna.Types.Coverage (CoverageFileType(..), mergeCoverageMaps, coverageStats)
-import Echidna.Output.Source (coverageLineHits, ppCoveredCode, saveLcovHook)
+import Echidna.Types.Coverage (CoverageFileType(..), coverageStats)
+import Echidna.Output.Source (CoverageSnapshot(..), coverageLineExecutions, coverageLineHits, ppCoveredCode, saveLcovHook, snapshotCoverage)
 import Echidna.Output.Corpus (loadTxs)
 
 import Echidna.Types.Config
@@ -473,7 +473,7 @@ showCoverageTool args env _ = do
        case Map.toList matches of
          [] -> return $ printf "Error: Contract '%s' not found" (unpack contractName)
          [(k, solc)] -> do
-            covMap <- mergeCoverageMaps dapp env.coverageRefInit env.coverageRefRuntime
+            snapshot <- snapshotCoverage env
             let sc = env.sourceCache
 
             -- Identify relevant files: only the file defining the contract
@@ -482,12 +482,12 @@ showCoverageTool args env _ = do
             -- Use all active contracts to generate coverage
             -- This allows showing coverage for a parent contract (e.g. EchidnaTest)
             -- derived from the execution of a child contract (e.g. Echidna).
-            let activeContracts = filter (\c -> c.runtimeCodehash `Map.member` covMap) (Map.elems dapp.solcByName)
+            let activeContracts = filter (\c -> c.runtimeCodehash `Map.member` snapshot.merged) (Map.elems dapp.solcByName)
             -- If no contracts are active (e.g. no coverage yet), use the requested contract to at least show the source
             let contractsToUse = if null activeContracts then [solc] else activeContracts
 
             -- Generate full report using all active contracts, then filter by relevant files
-            let fullReport = ppCoveredCode Txt sc contractsToUse covMap Nothing "" []
+            let fullReport = ppCoveredCode Txt sc contractsToUse snapshot Nothing "" []
             let filterReport text =
                   let ls = T.lines text
                       splitSections [] = []
@@ -644,6 +644,7 @@ data StreamableMCPState = StreamableMCPState
   , streamableMaxEvents :: Int
   , streamableMaxRequestBytes :: Int64
   , streamableCoverageRef :: IORef StreamableCoverageState
+  , streamableCoverageExecutionsRef :: IORef StreamableCoverageState
   , streamableReproducerCacheRef :: IORef (Map StreamableReproducerCacheKey StreamableReproducerVerification)
   , streamableInitialCorpusReplayRef :: IORef InitialCorpusReplayState
   , streamableInitialVm :: Maybe (VM Concrete)
@@ -686,9 +687,10 @@ runStreamableMCPServer env initialVm workerRefs = do
   started <- getCurrentTime
   eventsRef <- newIORef (StreamableEventBuffer 0 [])
   coverageRef <- newIORef StreamableCoverageNotComputed
+  coverageExecutionsRef <- newIORef StreamableCoverageNotComputed
   reproducerCacheRef <- newIORef Map.empty
   let conf = env.cfg.mcpConf
-      st = StreamableMCPState eventsRef started (max 1 conf.maxEvents) (fromIntegral $ max 1 conf.maxRequestBytes) coverageRef reproducerCacheRef env.initialCorpusReplayRef (Just initialVm)
+      st = StreamableMCPState eventsRef started (max 1 conf.maxEvents) (fromIntegral $ max 1 conf.maxRequestBytes) coverageRef coverageExecutionsRef reproducerCacheRef env.initialCorpusReplayRef (Just initialVm)
   ch <- subscribeEvents env
   _ <- forkIO $ forever $ do
     (ts, ev) <- atomically $ readTChan ch
@@ -796,6 +798,7 @@ streamableToolsList = object
       , streamableTool "get_reproducers" "List reproducer snapshots" streamableReproducersSchema
       , streamableTool "get_reproducer" "Get a reproducer snapshot" streamableReproducerSchema
       , streamableTool "get_coverage_hits" "Get coverage line hits" streamableEmptyArgsSchema
+      , streamableTool "get_coverage_executions" "Get per-line execution and failed-execution counts" streamableEmptyArgsSchema
       ]
   ]
   where
@@ -859,6 +862,7 @@ streamableResourcesList = object
       , streamableResource "echidna://run/reproducers" "Reproducer snapshots"
       , streamableResource "echidna://run/reproducer/<test-key>" "Single reproducer snapshot"
       , streamableResource "echidna://coverage/lines" "Coverage line hits"
+      , streamableResource "echidna://coverage/executions" "Coverage per-line execution counts"
       ]
   ]
   where
@@ -947,6 +951,9 @@ runStreamableTool env workerRefs st name args =
     "get_coverage_hits" -> do
       result <- streamableCoverageLinesWhenReady env st
       pure $ either (StreamableToolRpcError streamableCoverageNotReadyCode) StreamableToolOk result
+    "get_coverage_executions" -> do
+      result <- streamableCoverageExecutionsWhenReady env st
+      pure $ either (StreamableToolRpcError streamableCoverageNotReadyCode) StreamableToolOk result
     _ -> pure $ StreamableToolRpcError (-32602) ("Unknown tool: " <> name)
 
 readStreamableResource :: Env -> [IORef WorkerState] -> StreamableMCPState -> Text -> IO (Either Text Value)
@@ -962,6 +969,7 @@ readStreamableResource env workerRefs st uri =
         Left msg -> pure $ Left msg
         Right parsed -> Right <$> streamableReproducers env st parsed
     ("echidna://coverage/lines", _) -> streamableCoverageLinesWhenReady env st
+    ("echidna://coverage/executions", _) -> streamableCoverageExecutionsWhenReady env st
     (path, _) | "echidna://run/reproducer/" `T.isPrefixOf` path ->
       streamableReproducer env st (StreamableReproducerArgs . streamableDecodeUriComponent $ T.drop (T.length "echidna://run/reproducer/") path)
     _ -> pure . Left $ "Unknown resource: " <> uri
@@ -1135,31 +1143,47 @@ streamableResourceErrorCode msg
   | otherwise = -32602
 
 streamableCoverageLinesWhenReady :: Env -> StreamableMCPState -> IO (Either Text Value)
-streamableCoverageLinesWhenReady env st = do
+streamableCoverageLinesWhenReady = streamableCoverageWhenReady (.streamableCoverageRef)
+
+-- | Per-line execution counts, served next to the line hits and refreshed with
+-- them. A separate feed, so the line-hit payloads Guardian Sentry reads stay
+-- exactly as they were.
+streamableCoverageExecutionsWhenReady :: Env -> StreamableMCPState -> IO (Either Text Value)
+streamableCoverageExecutionsWhenReady = streamableCoverageWhenReady (.streamableCoverageExecutionsRef)
+
+streamableCoverageWhenReady
+  :: (StreamableMCPState -> IORef StreamableCoverageState)
+  -> Env -> StreamableMCPState -> IO (Either Text Value)
+streamableCoverageWhenReady feed env st = do
   ready <- initialCorpusReplayComplete st.streamableInitialCorpusReplayRef
   if ready
-    then Right <$> streamableCoverageLines env st
+    then Right <$> streamableCachedCoverage feed env st
     else pure $ Left streamableCoverageNotReadyMessage
 
 streamableCoverageLines :: Env -> StreamableMCPState -> IO Value
-streamableCoverageLines env st = do
-  cached <- readIORef st.streamableCoverageRef
+streamableCoverageLines = streamableCachedCoverage (.streamableCoverageRef)
+
+streamableCachedCoverage
+  :: (StreamableMCPState -> IORef StreamableCoverageState)
+  -> Env -> StreamableMCPState -> IO Value
+streamableCachedCoverage feed env st = do
+  cached <- readIORef (feed st)
   case cached of
     StreamableCoverageComputed snapshot -> pure snapshot
     StreamableCoverageRefreshing (Just snapshot) -> pure snapshot
     _ -> do
       streamableStartCoverageRefresh env st
-      streamableWaitForCoverageSnapshot st
+      streamableWaitForCoverageSnapshot (feed st)
 
-streamableWaitForCoverageSnapshot :: StreamableMCPState -> IO Value
-streamableWaitForCoverageSnapshot st = do
+streamableWaitForCoverageSnapshot :: IORef StreamableCoverageState -> IO Value
+streamableWaitForCoverageSnapshot ref = do
   waited <- timeout streamableCoverageTimeoutUsec waitLoop
   case waited of
     Just snapshot -> pure snapshot
-    Nothing -> streamableCoverageStateValue <$> readIORef st.streamableCoverageRef
+    Nothing -> streamableCoverageStateValue <$> readIORef ref
   where
     waitLoop = do
-      cached <- readIORef st.streamableCoverageRef
+      cached <- readIORef ref
       case cached of
         StreamableCoverageComputed snapshot -> pure snapshot
         StreamableCoverageRefreshing (Just snapshot) -> pure snapshot
@@ -1172,27 +1196,41 @@ streamableCoverageStateValue = \case
   StreamableCoverageRefreshing (Just snapshot) -> snapshot
   _ -> streamableEmptyCoverageLines
 
-streamableComputeCoverageLines :: Env -> IO Value
-streamableComputeCoverageLines env = do
-  covMap <- mergeCoverageMaps env.dapp env.coverageRefInit env.coverageRefRuntime
+-- | The line hits and the execution counts, from one pass over the coverage.
+streamableComputeCoverage :: Env -> IO (Value, Value)
+streamableComputeCoverage env = do
+  snapshot <- snapshotCoverage env
   let contracts = Map.elems env.dapp.solcByName
-      hits = coverageLineHits env.sourceCache covMap contracts env.cfg.campaignConf.coverageExcludes
-      snapshot = toJSON hits
-  BL8.length (encode snapshot) `seq` pure snapshot
+      excludes = env.cfg.campaignConf.coverageExcludes
+      lineHits = toJSON $ coverageLineHits env.sourceCache snapshot.merged contracts excludes
+      executions = toJSON $ coverageLineExecutions env.sourceCache snapshot.units snapshot.hits contracts excludes
+  BL8.length (encode lineHits) `seq` BL8.length (encode executions) `seq` pure (lineHits, executions)
 
+-- | Refresh both coverage feeds in the background. The line-hit feed decides
+-- whether a refresh is already running; the executions feed follows it.
 streamableStartCoverageRefresh :: Env -> StreamableMCPState -> IO ()
 streamableStartCoverageRefresh env st = do
-  (shouldStart, stale) <- atomicModifyIORef' st.streamableCoverageRef $ \case
-    state@(StreamableCoverageRefreshing _) -> (state, (False, Nothing))
-    StreamableCoverageComputed snapshot -> (StreamableCoverageRefreshing (Just snapshot), (True, Just snapshot))
-    StreamableCoverageNotComputed -> (StreamableCoverageRefreshing Nothing, (True, Nothing))
+  (shouldStart, stale) <- atomicModifyIORef' st.streamableCoverageRef markRefreshing
+  staleExecutions <- if shouldStart
+    then snd <$> atomicModifyIORef' st.streamableCoverageExecutionsRef markRefreshing
+    else pure Nothing
   when shouldStart $ void $ forkIO $
     do
-      computed <- try (streamableComputeCoverageLines env) :: IO (Either SomeException Value)
+      computed <- try (streamableComputeCoverage env) :: IO (Either SomeException (Value, Value))
       case computed of
-        Right snapshot -> writeIORef st.streamableCoverageRef (StreamableCoverageComputed snapshot)
-        _ -> writeIORef st.streamableCoverageRef $
-          maybe StreamableCoverageNotComputed StreamableCoverageComputed stale
+        Right (lineHits, executions) -> do
+          writeIORef st.streamableCoverageRef (StreamableCoverageComputed lineHits)
+          writeIORef st.streamableCoverageExecutionsRef (StreamableCoverageComputed executions)
+        _ -> do
+          writeIORef st.streamableCoverageRef $
+            maybe StreamableCoverageNotComputed StreamableCoverageComputed stale
+          writeIORef st.streamableCoverageExecutionsRef $
+            maybe StreamableCoverageNotComputed StreamableCoverageComputed staleExecutions
+  where
+    markRefreshing = \case
+      state@(StreamableCoverageRefreshing _) -> (state, (False, Nothing))
+      StreamableCoverageComputed snapshot -> (StreamableCoverageRefreshing (Just snapshot), (True, Just snapshot))
+      StreamableCoverageNotComputed -> (StreamableCoverageRefreshing Nothing, (True, Nothing))
 
 streamableMaybeRefreshCoverage :: Env -> StreamableMCPState -> Worker.CampaignEvent -> IO ()
 streamableMaybeRefreshCoverage env st = \case

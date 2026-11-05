@@ -20,6 +20,8 @@ module Common
   , countCorpus
   , codeUnits
   , uniqueCodehashes
+  , hitCountInvariants
+  , lineExecutionsReported
   , overrideQuiet
   , loadSolTests
   , checkCoverageUsesCorpusDir
@@ -27,22 +29,28 @@ module Common
   ) where
 
 import Control.Concurrent.STM (newBroadcastTChanIO)
-import Control.Monad (forM_)
+import Control.Monad (forM, forM_)
 import Control.Monad.Random (getRandomR)
 import Control.Monad.Reader (runReaderT)
 import Data.DoubleWord (Int256)
 import Data.Function ((&))
 import Data.IORef
+import Data.Primitive.PrimArray (readPrimArray)
+import Data.Vector.Unboxed qualified as VU
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.List.Split (splitOn)
 import Data.Map qualified as Map
-import Data.Maybe (isJust)
+import Data.List (isSuffixOf)
+import Data.Maybe (fromMaybe, isJust)
+import Data.Word (Word64)
 import Data.SemVer (Version, version, fromText)
 import Data.Text (Text, pack)
+import Data.Text qualified as T
 import System.Process (readProcess)
 import Test.Tasty (TestTree)
 import Test.Tasty.HUnit (testCase, assertBool)
 
+import EVM.Dapp (DappInfo(..))
 import EVM.Solidity (Contracts(..), BuildOutput(..), SolcContract(..))
 import EVM.Types hiding (Env, Gas)
 
@@ -55,7 +63,9 @@ import Echidna.Test (checkETest)
 import Echidna.Types.Agent (runAgent)
 import Echidna.Types.Campaign
 import Echidna.Types.Config (Env(..), EConfig(..), EConfigWithUsage(..))
-import Echidna.Types.Coverage (coverageStatsExact)
+import Echidna.Coverage.HitCounts (HitCountSnapshot(..), snapshotHitCounts)
+import Echidna.Output.Source (CoverageSnapshot(..), LineExecutions(..), coverageLineExecutions, coverageLineHits, ppCoveredCode, snapshotCoverage)
+import Echidna.Types.Coverage (CovEntry(..), CoverageFileType(..), coverageStatsExact)
 import Echidna.Types.Signature (ContractName)
 import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Test
@@ -302,6 +312,61 @@ uniqueCodehashes :: Int -> (Env, WorkerState) -> IO Bool
 uniqueCodehashes n (env, _) = do
   (_, codehashes) <- coverageStatsExact env.coverageRefInit env.coverageRefRuntime
   pure $ codehashes == n
+
+-- | Hit counts agree with coverage: a pc has executions iff it is covered,
+-- failed executions never exceed executions, no unit was dropped, and at
+-- least one covered pc executed only inside failing transactions.
+hitCountInvariants :: (Env, WorkerState) -> IO Bool
+hitCountInvariants (env, _) = do
+  creation <- readIORef env.coverageRefInit
+  runtime <- readIORef env.coverageRefRuntime
+  snaps <- snapshotHitCounts env.coverageSlots
+  let units = Map.elems creation ++ Map.elems runtime
+  checks <- forM units $ \entry -> case Map.lookup (entry.kind, entry.key) snaps of
+    Nothing -> pure (False, False)
+    Just snap -> do
+      depths <- forM [0 .. entry.len - 1] $ \pc -> readPrimArray entry.bits (2 * pc)
+      let execs = VU.toList snap.execs
+          failed = VU.toList snap.failedExecs
+          agree = and [ (e > 0) == (d /= 0) | (e, d) <- zip execs depths ]
+          bounded = and (zipWith (<=) failed execs)
+          onlyFailing = or [ f == e && e > 0 | (e, f) <- zip execs failed ]
+      pure (agree && bounded && not snap.incomplete, onlyFailing)
+  pure $ not (null checks) && all fst checks && any snd checks
+
+-- | On coverage/hitcounts.sol the executions feed (@coverage_exec_counts.json@,
+-- MCP @get_coverage_executions@) counts executions: the loop body runs more
+-- often than its function header, the always-reverting line runs only inside
+-- failed transactions, and both feeds cover the same lines. The line-hits
+-- feed Sentry reads keeps LCOV's @DA:@ values.
+lineExecutionsReported :: (Env, WorkerState) -> IO Bool
+lineExecutionsReported (env, _) = do
+  snapshot <- snapshotCoverage env
+  let contracts = Map.elems env.dapp.solcByName
+      hits = snapshot.hits
+      executions = coverageLineExecutions env.sourceCache snapshot.units hits contracts []
+      lineHits = coverageLineHits env.sourceCache snapshot.merged contracts []
+      lcov = ppCoveredCode Lcov env.sourceCache contracts snapshot Nothing "" []
+      lcovDA = Map.fromList
+        [ (read (T.unpack l) :: Int, read (T.unpack c) :: Word64)
+        | da <- T.lines lcov, Just rest <- [T.stripPrefix "DA:" da]
+        , [l, c] <- [T.splitOn "," rest] ]
+      onFixture :: Map.Map FilePath (Map.Map Int a) -> [Map.Map Int a]
+      onFixture m = [ lines' | (path, lines') <- Map.toList m, "hitcounts.sol" `isSuffixOf` path ]
+  case (onFixture executions, onFixture lineHits) of
+    ([file], [hitsFile]) -> do
+      let at n = Map.lookup n file
+          execsAt n = maybe 0 (fromMaybe 0 . (.executions)) (at n)
+          header = execsAt 6      -- function loop(uint8 n) public {
+          body = execsAt 8        -- total += i;
+          reverting = at 13       -- total += x; (always followed by a revert)
+          revertsOnly = case reverting of
+            Just (LineExecutions (Just e) (Just f)) -> e > 0 && e == f
+            _ -> False
+          sameLines = Map.keys file == Map.keys hitsFile
+          hitsMatchLcov = and [ Map.lookup n lcovDA == Just v | (n, v) <- Map.toList hitsFile ]
+      pure $ isJust hits && header > 0 && body > header && revertsOnly && sameLines && hitsMatchLcov
+    _ -> pure False
 
 countCorpus :: Int -> (Env, WorkerState) -> IO Bool
 countCorpus n (env, _) = do
