@@ -1,3 +1,12 @@
+## 4.5
+
+* Per-line execution counts, and how many of those runs were in failed transactions, in the HTML report, `coverage_exec_counts.json` and the MCP `get_coverage_executions` tool. New `coverageHitCounts: auto | true | false` key (#26)
+* Jump-edge coverage, on by default: a sequence that takes a new JUMP/JUMPI edge is kept in the corpus even when it reaches no new instruction. Turn it off with `coverageEdges: false`. The `New coverage` log line ends with the edge count (#28)
+* Coverage is kept per worker in atomic arrays, and creation-code coverage is keyed by the creation codehash (#25)
+* Foundry projects built with Solar get coverage on the right files: Echidna reads Foundry's build-info to tell solc from Solar and uses Solar's file ids (#23, #30)
+* A cheatcode call that fails keeps its gas (#24)
+* `echidna --version` and the UI title report 4.5.
+
 ## 4.4.1
 
 * `echidna --version` and the UI title report 4.4.1.
