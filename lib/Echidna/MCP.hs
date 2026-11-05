@@ -1647,9 +1647,10 @@ streamableWorkerPayload :: MCPConf -> Worker.WorkerEvent -> Value
 streamableWorkerPayload conf = \case
   Worker.TestFalsified test -> streamableEventTestPayload conf test
   Worker.TestOptimized test -> streamableEventTestPayload conf test
-  Worker.NewCoverage points numCodehashes corpusSize _transactions -> object
+  Worker.NewCoverage points numCodehashes edges corpusSize _transactions -> object
     [ "coverage" .= points
     , "contracts" .= numCodehashes
+    , "edges" .= edges
     , "corpus_size" .= corpusSize
     , "transactions" .= ([] :: [Value])
     , "transactionsTruncated" .= True

@@ -10,7 +10,7 @@ import Test.Tasty.HUnit (testCase, assertBool, (@?=))
 
 import EVM.Solidity (BuildOutput(..), SolcContract(..), SourceCache(..), SrcMap(..), getContractsMap)
 
-import Common (testContract, testContract', passed, countCorpus, checkCoverageUsesCorpusDir, codeUnits, uniqueCodehashes, hitCountInvariants, lineExecutionsReported)
+import Common (testContract, testContract', passed, countCorpus, checkCoverageUsesCorpusDir, codeUnits, uniqueCodehashes, hitCountInvariants, lineExecutionsReported, uniqueEdgesAtLeast)
 import Echidna.Solidity (readSolcBatch)
 import Echidna.Types.Worker (WorkerType(..))
 import Echidna.Solidity.Foundry
@@ -38,6 +38,18 @@ coverageTests = testGroup "Coverage tests"
   , testContract "coverage/hitcounts.sol"     (Just "coverage/boolean.yaml")
       [ ("hit counts agree with coverage",        hitCountInvariants)
       , ("line executions reported",             lineExecutionsReported)]
+
+  -- Edge coverage: taken jumps are recorded and reported
+  , testContract "coverage/boolean.sol"       (Just "coverage/edges.yaml")
+      [ ("echidna_true failed",                    passed     "echidna_true")
+      , ("jump edges recorded",                    uniqueEdgesAtLeast 4)]
+
+  -- A new jump into covered code keeps its sequence only with edge coverage:
+  -- the same campaign keeps two more sequences with edges on
+  , testContract "coverage/edge_only.sol"     (Just "coverage/edge_only.yaml")
+      [ ("edge-only novelty kept",                countCorpus 7)]
+  , testContract "coverage/edge_only.sol"     (Just "coverage/edge_only_off.yaml")
+      [ ("instruction novelty only",              countCorpus 5)]
 
   -- Test corpus and coverage directory functionality
   , testContract "basic/revert.sol"              (Just "basic/coverage-test.yaml")

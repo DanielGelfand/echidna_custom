@@ -1,0 +1,5 @@
+seed: 3
+workers: 1
+testLimit: 2000
+seqLen: 1
+coverageEdges: false
