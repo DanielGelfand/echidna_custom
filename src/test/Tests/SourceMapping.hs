@@ -128,7 +128,9 @@ fixture variant = do
 
 childOf :: BuildOutput -> SolcContract
 childOf (BuildOutput (Contracts contracts) _) =
-  head [c | c <- Map.elems contracts, ":Child" `T.isSuffixOf` c.contractName]
+  case [c | c <- Map.elems contracts, ":Child" `T.isSuffixOf` c.contractName] of
+    [child] -> child
+    _ -> error "fixture must contain exactly one Child contract"
 
 patchImmutables :: Int -> SolcContract -> BS.ByteString
 patchImmutables value contract =

@@ -33,16 +33,19 @@ jobs:
             mkdir -p "$RUNNER_TEMP/solc-$version"
             curl -fsSL "https://github.com/ethereum/solidity/releases/download/v$version/solc-static-linux" -o "$RUNNER_TEMP/solc-$version/solc"
             chmod +x "$RUNNER_TEMP/solc-$version/solc"
+            artifact_dir="${VIRTUAL_ENV:-$HOME}/.solc-select/artifacts/solc-$version"
+            mkdir -p "$artifact_dir"
+            ln -s "$RUNNER_TEMP/solc-$version/solc" "$artifact_dir/solc-$version"
           done
       - name: Build and test in the Nix development shell
         run: |
           nix develop --command bash -euo pipefail -c '
             cabal update
             cabal build all --enable-tests
-            cabal test --test-show-details=direct --test-options="-p !/Symbolic/"
             test_path="$PATH"
             for version in 0.8.10 0.8.25; do
               export PATH="$RUNNER_TEMP/solc-$version:$test_path"
+              export SOLC_VERSION="$version"
               solc --version
               cabal test --test-show-details=direct --test-options="-p !/Symbolic/"
             done
