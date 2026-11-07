@@ -79,8 +79,8 @@ readFoundryBuilds cryticArgs root = do
     readBuildInfoDir root (root </> out </> "build-info")
 
 -- crytic-compile's combined JSON drops immutable locations. Recover them from
--- the corresponding Foundry artifact, but only when its complete runtime
--- bytecode matches this export. A stale artifact must never mask code bytes.
+-- the corresponding Foundry artifact, but only when its complete bytecode
+-- matches this export. A stale artifact must never mask code bytes.
 restoreImmutableReferences :: [String] -> FilePath -> BuildOutput -> IO BuildOutput
 restoreImmutableReferences args root original@(BuildOutput (Contracts contracts) sources) = do
   isFoundry <- doesFileExist (root </> "foundry.toml")
@@ -99,9 +99,9 @@ restoreImmutableReferences args root original@(BuildOutput (Contracts contracts)
         artifact <- if exists then either (const Nothing) Just <$> eitherDecodeFileStrict path
                               else pure Nothing
         pure $ case artifact >>= parseMaybe runtimeReferences of
-          Just (code, refs)
-            | T.toLower (maybe code id $ T.stripPrefix "0x" code)
-                == TE.decodeUtf8 (Base16.encode contract.runtimeCode)
+          Just (creation, runtime, refs)
+            | matches creation contract.creationCode
+            , matches runtime contract.runtimeCode
             , all (validReference $ BS.length contract.runtimeCode) (concat $ Map.elems refs)
             -> contract { immutableReferences = refs }
           _ -> contract
@@ -109,11 +109,16 @@ restoreImmutableReferences args root original@(BuildOutput (Contracts contracts)
   validReference size (Reference start len) =
     start >= 0 && len > 0 && len <= size && start <= size - len
 
-  runtimeReferences :: Value -> Parser (Text, Map W256 [Reference])
+  matches code bytes =
+    T.toLower (maybe code id $ T.stripPrefix "0x" code)
+      == TE.decodeUtf8 (Base16.encode bytes)
+
+  runtimeReferences :: Value -> Parser (Text, Text, Map W256 [Reference])
   runtimeReferences = withObject "artifact" $ \artifact -> do
+    creation <- artifact .: "bytecode" >>= withObject "creation bytecode" (.: "object")
     deployed <- artifact .: "deployedBytecode"
     withObject "deployed bytecode" (\code ->
-      (,) <$> code .: "object" <*> code .:? "immutableReferences" .!= mempty) deployed
+      (creation,,) <$> code .: "object" <*> code .:? "immutableReferences" .!= mempty) deployed
 
 -- | The out directory crytic-compile's @--foundry-out-directory@ names.
 foundryOutArg :: [String] -> Maybe FilePath

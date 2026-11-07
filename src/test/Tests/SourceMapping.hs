@@ -101,6 +101,13 @@ sourceMappingTests = testGroup "Source mapping"
         (fixtureRoot "solar-none") (BuildOutput (Contracts changed) sources)
       let BuildOutput (Contracts actual) _ = restored
       assertBool "stale locations were used" $ all (Map.null . (.immutableReferences)) actual
+      -- Equal runtime bytes alone do not prove that the current constructor
+      -- writes the same locations as an older artifact's constructor.
+      let changedCreation = Map.map (\c -> c { creationCode = BS.cons 0xfe $ BS.drop 1 c.creationCode }) contracts
+      restoredCreation <- restoreImmutableReferences ["--foundry-out-directory", "out"]
+        (fixtureRoot "solar-none") (BuildOutput (Contracts changedCreation) sources)
+      let BuildOutput (Contracts actualCreation) _ = restoredCreation
+      assertBool "stale constructor locations were used" $ all (Map.null . (.immutableReferences)) actualCreation
       -- The unmodified fixture supplies the locations, proving this is not a no-op.
       restoredOriginal <- restoreImmutableReferences ["--foundry-out-directory", "out"]
         (fixtureRoot "solar-none") raw
