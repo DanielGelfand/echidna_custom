@@ -43,13 +43,15 @@ jobs:
             cabal update
             cabal build all --enable-tests
             test_path="$PATH"
+            suite_status=0
             for version in 0.8.10 0.8.25; do
               export PATH="$RUNNER_TEMP/solc-$version:$test_path"
               export SOLC_VERSION="$version"
               solc --version
-              cabal test --test-show-details=direct --test-options="-p !/Symbolic/"
+              cabal test --test-show-details=direct --test-options="-p !/Symbolic/" || suite_status=1
             done
             python3 tests/memory/regression.py "$(cabal list-bin exe:echidna)"
+            exit "$suite_status"
           '
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
