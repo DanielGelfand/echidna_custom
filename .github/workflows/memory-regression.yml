@@ -23,18 +23,29 @@ jobs:
       - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71
         with:
           name: trailofbits
-      - name: Install pinned Foundry
+      - name: Install pinned Foundry and solc
         run: |
           mkdir -p "$RUNNER_TEMP/foundry"
           curl -fsSL https://github.com/foundry-rs/foundry/releases/download/v1.9.0/foundry_v1.9.0_linux_amd64.tar.gz -o "$RUNNER_TEMP/foundry.tar.gz"
           tar -xzf "$RUNNER_TEMP/foundry.tar.gz" -C "$RUNNER_TEMP/foundry"
           echo "$RUNNER_TEMP/foundry" >> "$GITHUB_PATH"
+          for version in 0.8.10 0.8.25; do
+            mkdir -p "$RUNNER_TEMP/solc-$version"
+            curl -fsSL "https://github.com/ethereum/solidity/releases/download/v$version/solc-static-linux" -o "$RUNNER_TEMP/solc-$version/solc"
+            chmod +x "$RUNNER_TEMP/solc-$version/solc"
+          done
       - name: Build and test in the Nix development shell
         run: |
           nix develop --command bash -euo pipefail -c '
             cabal update
             cabal build all --enable-tests
             cabal test --test-show-details=direct --test-options="-p !/Symbolic/"
+            test_path="$PATH"
+            for version in 0.8.10 0.8.25; do
+              export PATH="$RUNNER_TEMP/solc-$version:$test_path"
+              solc --version
+              cabal test --test-show-details=direct --test-options="-p !/Symbolic/"
+            done
             python3 tests/memory/regression.py "$(cabal list-bin exe:echidna)"
           '
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

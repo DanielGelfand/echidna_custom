@@ -19,7 +19,7 @@ import EVM.Types (Contract(..), ContractCode(..), RuntimeCode(..), word256Bytes)
 import Echidna.Solidity (readSolcBatch)
 import Echidna.Solidity.Foundry (restoreImmutableReferences)
 import Echidna.SourceMapping
-  (cacheCodehash, findSrcForReal, lookupCodehash, maxCodehashCacheEntries)
+  (cacheCodehash, findSrcForReal, lookupCodehash, maxCodehashCacheEntries, stripFinalMetadata)
 import Echidna.SymExec.Symbolic (forceWord)
 
 sourceMappingTests :: TestTree
@@ -79,8 +79,20 @@ sourceMappingTests = testGroup "Source mapping"
       (build, child) <- fixture "solar-none"
       let changed = BS.cons 0xfe $ BS.drop 1 $ patchImmutables 7 child
           contract = initialContract $ RuntimeCode $ ConcreteRuntimeCode changed
+          changedInit = initialContract $ InitCode
+            (BS.cons 0xfe $ BS.drop 1 child.creationCode <> word256Bytes 7) mempty
+          truncatedInit = initialContract $ InitCode (BS.init child.creationCode) mempty
       findSrcForReal (dappInfo "" build) contract @?= Nothing
       findSrcForReal emptyDapp contract @?= Nothing
+      findSrcForReal (dappInfo "" build) changedInit @?= Nothing
+      findSrcForReal (dappInfo "" build) truncatedInit @?= Nothing
+
+  , testCase "embedded metadata does not hide later executable bytes" $ do
+      (_, child) <- fixture "solar-ipfs"
+      let withSuffix = child.runtimeCode <> BS.singleton 0xfe
+      stripFinalMetadata withSuffix @?= withSuffix
+      assertBool "valid final metadata was not removed" $
+        BS.length (stripFinalMetadata child.runtimeCode) < BS.length child.runtimeCode
 
   , testCase "a stale Foundry artifact cannot supply immutable locations" $ do
       raw@(BuildOutput (Contracts contracts) sources) <- rawFixture "solar-none"
