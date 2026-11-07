@@ -144,11 +144,16 @@ findSrcByTemplate contr dapp = case contr.code of
 -- Embedded contracts can have their own metadata. Only remove a validated
 -- final trailer, so executable bytes after an embedded trailer still matter.
 stripFinalMetadata :: ByteString -> ByteString
-stripFinalMetadata bytes =
-  let metadata = getBytecodeMetadata bytes
-  in if metadata /= bytes && metadata `BS.isSuffixOf` bytes
-     then BS.take (BS.length bytes - BS.length metadata) bytes
-     else bytes
+stripFinalMetadata bytes
+  | size < 2 = bytes
+  | start >= 0 && any (`BS.isPrefixOf` metadata) knownBzzrPrefixes = BS.take start bytes
+  | otherwise = bytes
+  where
+  size = BS.length bytes
+  metadataSize = fromIntegral (BS.index bytes (size - 2)) `shiftL` 8
+             .|. fromIntegral (BS.index bytes (size - 1))
+  start = size - metadataSize - 2
+  metadata = BS.drop start bytes
 
 -- | Find the position of CBOR length indicator after a metadata prefix.
 -- The length indicator is 2 bytes that encode the distance from prefix start to that position.

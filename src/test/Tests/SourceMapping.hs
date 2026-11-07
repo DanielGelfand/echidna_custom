@@ -87,12 +87,18 @@ sourceMappingTests = testGroup "Source mapping"
       findSrcForReal (dappInfo "" build) changedInit @?= Nothing
       findSrcForReal (dappInfo "" build) truncatedInit @?= Nothing
 
-  , testCase "embedded metadata does not hide later executable bytes" $ do
+  , testCase "metadata length comes from the final trailer" $ do
       (_, child) <- fixture "solar-ipfs"
       let withSuffix = child.runtimeCode <> BS.singleton 0xfe
       stripFinalMetadata withSuffix @?= withSuffix
       assertBool "valid final metadata was not removed" $
         BS.length (stripFinalMetadata child.runtimeCode) < BS.length child.runtimeCode
+      -- Hash bytes can look like an earlier length field (0x000b at offset 11).
+      let marker = BS.pack [0xa2, 0x64, 0x69, 0x70, 0x66, 0x73, 0x58, 0x22]
+          (program, metadata) = BS.breakSubstring marker child.runtimeCode
+          ambiguous = program <> BS.take 11 metadata <> BS.pack [0, 11] <> BS.drop 13 metadata
+      assertBool "fixture has no IPFS metadata" $ not (BS.null metadata)
+      stripFinalMetadata ambiguous @?= program
 
   , testCase "a stale Foundry artifact cannot supply immutable locations" $ do
       raw@(BuildOutput (Contracts contracts) sources) <- rawFixture "solar-none"
